@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jarvis-trading-friend-mcp"
-version = "0.2.0"
+version = "0.2.1"
 description = "MCP server bridging Claude → Brady's jarvis-trading research API. For trusted friends only — research and informational, not financial advice."
 requires-python = ">=3.10"
 dependencies = ["requests>=2.28"]
