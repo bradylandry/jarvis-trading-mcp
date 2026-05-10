@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jarvis-trading-friend-mcp"
+version = "0.2.0"
+description = "MCP server bridging Claude → Brady's jarvis-trading research API. For trusted friends only — research and informational, not financial advice."
+requires-python = ">=3.10"
+dependencies = ["requests>=2.28"]
+
+[project.scripts]
+jarvis-trading-mcp = "friend_mcp.server:main"
+
+# Explicit package discovery. Without this, setuptools auto-discovery
+# can flatten the package — landed in 0.1.0 where the layout had
+# server.py + __init__.py at the same level as pyproject.toml, causing
+# `import friend_mcp.server` to fail because setuptools registered
+# `server` as a top-level module instead. The 0.1.1 fix moves the
+# package contents into a nested friend_mcp/ subdirectory and tells
+# setuptools to find packages explicitly. Reference:
+# https://setuptools.pypa.io/en/latest/userguide/package_discovery.html
+[tool.setuptools.packages.find]
+include = ["friend_mcp*"]
