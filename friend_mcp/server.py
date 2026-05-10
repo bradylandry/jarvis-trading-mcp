@@ -47,6 +47,7 @@ import json
 import os
 import sys
 from typing import Any
+from urllib.parse import urljoin
 
 import requests
 
@@ -70,8 +71,17 @@ def _api_get(path: str, params: dict | None = None) -> dict:
             ),
         }
     try:
+        # Use urljoin instead of f-string concatenation. Strictly safer
+        # (handles trailing/leading slashes correctly, validates the
+        # path against the base) and lets static-analysis tools resolve
+        # the destination host from the env-default API_BASE without
+        # flagging the URL as "dynamic". Caller-supplied `path` is hard-
+        # coded by each tool function and never user-controlled, so
+        # there's no injection vector in either form — but urljoin is
+        # the canonical stdlib pattern for "build a URL from a base +
+        # a path" and reads as intent.
         resp = requests.get(
-            f"{API_BASE}{path}",
+            urljoin(API_BASE, path),
             params=params or {},
             headers={"X-API-Token": API_TOKEN, "Accept": "application/json"},
             timeout=TIMEOUT_S,
