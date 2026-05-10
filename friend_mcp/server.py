@@ -46,6 +46,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
+from collections import deque
 from typing import Any
 from urllib.parse import urljoin
 
@@ -55,6 +57,45 @@ import requests
 API_BASE  = os.environ.get("JARVIS_TRADING_API", "https://trading.landrycmd.com").rstrip("/")
 API_TOKEN = os.environ.get("JARVIS_TRADING_TOKEN", "")
 TIMEOUT_S = 90
+
+# Client-side rate limit. Friend's audit (2026-05-10) flagged that a
+# runaway tool-call loop in a Claude session could burn through Brady's
+# upstream API budget AND the friend's per-token quota faster than Brady's
+# server-side limits would catch it. The MCP is the natural place to add
+# a soft client-side ceiling. Defaults: 30 calls per 60 seconds, sliding
+# window. Override via JARVIS_TRADING_MAX_CALLS_PER_MIN env var if
+# legitimately needed (e.g., automated workflows).
+RATE_LIMIT_MAX_CALLS = int(os.environ.get("JARVIS_TRADING_MAX_CALLS_PER_MIN", "30"))
+RATE_LIMIT_WINDOW_S  = 60
+_call_history: deque[float] = deque()
+
+
+def _rate_limit_check() -> dict | None:
+    """Sliding-window rate check. Returns an error dict if the limit is hit;
+    None if the call is allowed (and records the call timestamp).
+
+    Single-process state — there's no concurrent-tool concern in stdio MCPs
+    (Claude calls one tool at a time, awaits the JSON response, then calls
+    the next), so a simple deque is safe without a lock."""
+    now = time.monotonic()
+    cutoff = now - RATE_LIMIT_WINDOW_S
+    while _call_history and _call_history[0] < cutoff:
+        _call_history.popleft()
+    if len(_call_history) >= RATE_LIMIT_MAX_CALLS:
+        oldest = _call_history[0]
+        wait_s = max(0, int(oldest + RATE_LIMIT_WINDOW_S - now))
+        return {
+            "error": (
+                f"Client-side rate limit hit ({RATE_LIMIT_MAX_CALLS} calls per "
+                f"{RATE_LIMIT_WINDOW_S}s). Wait ~{wait_s}s before retrying. "
+                f"This protects Brady's upstream API budget and your token "
+                f"quota from runaway tool-call loops. If you legitimately need "
+                f"a higher rate, set JARVIS_TRADING_MAX_CALLS_PER_MIN in your "
+                f"Claude config's env block."
+            ),
+        }
+    _call_history.append(now)
+    return None
 
 
 # ── Generic API helpers ────────────────────────────────────────────────────
@@ -70,6 +111,9 @@ def _api_get(path: str, params: dict | None = None) -> dict:
                 "under env: { JARVIS_TRADING_TOKEN: \"tok_...\" }."
             ),
         }
+    rate_err = _rate_limit_check()
+    if rate_err:
+        return rate_err
     try:
         # Use urljoin instead of f-string concatenation. Strictly safer
         # (handles trailing/leading slashes correctly, validates the

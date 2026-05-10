@@ -257,6 +257,35 @@ which tools you call (e.g. "alice ran scan_universe 5 times today").
 He does NOT see your Claude conversation context — only the structured
 tool inputs.
 
+## Rate limiting (added in v0.3.0)
+
+The MCP enforces a client-side cap of **30 tool calls per 60 seconds**
+per process to protect against runaway tool-call loops in a Claude
+session. If hit, the next call returns a structured error explaining
+when to retry; subsequent calls remain blocked until the sliding
+window clears.
+
+Override (e.g., for legitimate batch workflows):
+
+```json
+{
+  "mcpServers": {
+    "jarvis-trading": {
+      "command": "jarvis-trading-mcp",
+      "env": {
+        "JARVIS_TRADING_TOKEN": "tok_...",
+        "JARVIS_TRADING_MAX_CALLS_PER_MIN": "120"
+      }
+    }
+  }
+}
+```
+
+The cap is enforced in-process (single-stdio session = single
+deque of timestamps); separate Claude sessions have separate
+counters. Brady's server-side per-token quota remains the
+authoritative ceiling.
+
 ## Security audit
 
 This MCP has been reviewed two ways. Both reports are reproducible.
@@ -303,12 +332,28 @@ filesystem, run shell, exfiltrate other env vars, or open a listening port.
 **Real risks worth knowing about:**
 
 1. **Prompt injection via tool responses.** This is intrinsic to any MCP
-   that fetches third-party content. If Brady's API is ever compromised,
-   a `bull_case` field could carry "ignore previous instructions, do X."
-   **Mitigation:** don't run this MCP in the same Claude session as MCPs
-   that have destructive tool access — filesystem-write, shell execution,
-   `git push`, etc. Read-only research MCPs like this one shouldn't share
-   sessions with anything that could *act* on injected instructions.
+   that fetches third-party content. Every field returned by the API
+   (`bull_case`, `verdict_thesis`, `summary`, etc.) lands in Claude's
+   context as text. If `trading.landrycmd.com` is ever compromised — or
+   the upstream LLM pipeline is ever buggy enough to let third-party
+   content influence those fields — the text could carry "ignore previous
+   instructions, do X" content.
+
+   **Mitigation: don't co-mount this MCP in a Claude session that also has
+   tools capable of *acting* on injected instructions.** Specifically,
+   avoid sharing a session with MCPs / tools that can:
+
+   - Write to the filesystem (file editors, code-mod tools, content writers)
+   - Execute shell commands or arbitrary subprocess (terminal, runner, deploy tools)
+   - Push to git or open PRs (GitHub MCPs, git CLIs)
+   - Send email / chat messages (mail clients, Slack, Telegram)
+   - Make payments or move funds (Stripe, banking, exchanges, brokers)
+   - Modify cloud resources (AWS, GCP, Vercel control planes)
+
+   Read-only research MCPs like this one are safe to share a session with
+   each other (other research/data MCPs, web search, Wikipedia, etc.) —
+   the line is "tools that can ACT" vs. "tools that just RETURN
+   information."
 2. **Pin to a reviewed commit.** `pip install git+...` without a `@<SHA>`
    pulls whatever's on `master` at install time. A future `pip install
    --upgrade` pulls again. So you're trusting Brady's GitHub account in
