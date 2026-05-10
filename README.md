@@ -259,8 +259,31 @@ tool inputs.
 
 ## Security audit
 
-A friend's audit (2026-05-08) flagged the actual risks in installing
-this MCP. Worth knowing:
+This MCP has been reviewed two ways. Both reports are reproducible.
+
+### Automated audit (2026-05-10) — score 10/10
+
+Run the static-analysis tool [mcp-audit](https://github.com/bradylandry/mcp-audit)
+on this repo:
+
+```bash
+pip install git+https://github.com/bradylandry/mcp-audit.git
+git clone https://github.com/bradylandry/jarvis-trading-mcp.git
+mcp-audit jarvis-trading-mcp/
+```
+
+Output: **Score 10/10 — low risk.** Capabilities map matches the
+manual claims below. Frozen audit report:
+[mcp-audit/examples/jarvis-trading-mcp-audit.md](https://github.com/bradylandry/mcp-audit/blob/main/examples/jarvis-trading-mcp-audit.md).
+
+The earlier 0.2.0 release scored 9/10 because URL construction used an
+f-string (`f"{API_BASE}{path}"`). 0.2.1 switched to `urllib.parse.urljoin`
+— behaviorally identical, removes the audit warning, reads as intent.
+
+### Manual audit (2026-05-08)
+
+A friend's audit flagged the actual risks in installing this MCP.
+Worth knowing:
 
 **What this MCP can and can't do** (audited; no surprises):
 
