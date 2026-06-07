@@ -1,0 +1,17 @@
+{
+  "friend_mcp/__init__.py": {
+    "mtime": 1779924379.8876731,
+    "ast_hash": "333e52b913866c546f89cf94d3046026",
+    "semantic_hash": ""
+  },
+  "friend_mcp/server.py": {
+    "mtime": 1779924379.8878396,
+    "ast_hash": "b7bbb4507a075bc4287260a2f50b02e6",
+    "semantic_hash": ""
+  },
+  "README.md": {
+    "mtime": 1779924379.8874404,
+    "ast_hash": "19325f90c29e0d01efd317df0b38fbee",
+    "semantic_hash": ""
+  }
+}
