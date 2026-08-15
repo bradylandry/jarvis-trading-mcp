@@ -209,7 +209,7 @@ def main() -> None:
             "refusing to start remote HTTP transport without authentication; "
             "set AUTH_CLIENT_ID, bind HOST=127.0.0.1, or set ALLOW_UNAUTHENTICATED=1 to override"
         )
-    mcp.run(transport="http", host=host, port=port)
+    mcp.run(transport="http", host=host, port=port)  # mcp-audit: ignore MCP001  (FastMCP server start, not a subprocess/shell call)
 
 
 if __name__ == "__main__":
