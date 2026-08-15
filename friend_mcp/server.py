@@ -1,395 +1,215 @@
-"""friend_mcp.server — MCP server bridging Claude → jarvis-trading research API.
+"""friend_mcp.server — remote, OAuth-gated MCP server for the Jarvis Trading research API.
 
-A small stdio MCP server that friends install locally + register in their
-Claude Desktop / Claude Code config. Each tool call hits the public
-trading-site API at https://trading.landrycmd.com with the friend's
-X-API-Token (set via env var JARVIS_TRADING_TOKEN). The server itself
-holds no credentials beyond what the friend sets — Brady controls token
-issuance and revocation centrally on the server side.
+Tier 1 rewrite: ports the original local stdio bridge to a remote, authenticated HTTP
+server mirroring the vault-mcp-server pattern. Same 7 read-only tools, same trading API
+(trading.landrycmd.com), same client-side rate limiter, now reachable by Claude web /
+desktop / mobile behind Entra OAuth.
 
-Tools exposed:
+Auth model:
+  - Client -> this server: Entra OAuth (AzureProvider), the *landrycmd* tenant. Enabled only
+    when AUTH_CLIENT_ID is set (i.e. in the deployed Container App); omitted locally so
+    loopback dev runs without a token. Fails CLOSED on a public bind (see main()).
+  - This server -> trading API: static X-API-Token, sourced from macOS Keychain (local, via
+    JARVIS_TRADING_TOKEN set by run-local.sh) or Azure Key Vault via Managed Identity (in
+    Azure). Never written to disk.
 
-  - scan_universe(mode, budget, opt_type)
-      Curated 50-name liquid optionable universe scan. Returns top
-      candidates ranked by fit_score under the chosen hunt mode.
+All tools are read-only research: none place orders, move funds, or write anything.
 
-  - get_thesis(ticker, strike, expiration, opt_type)
-      Plain-English thesis from Grok + Kimi A/B for a specific contract.
-      Includes catalyst + IV + market-regime + directional-fit gating.
+Env vars:
+  # user auth (deployed only; landrycmd tenant)
+  AUTH_CLIENT_ID, AUTH_CLIENT_SECRET, AUTH_TENANT_ID, PUBLIC_BASE_URL
+  # backend token (one source required):
+  JARVIS_TRADING_TOKEN                        -> local dev (from Keychain via run-local.sh)
+  KEY_VAULT_URL + JARVIS_TOKEN_SECRET_NAME    -> Azure (pull via Managed Identity)
+  # backend + limits
+  JARVIS_TRADING_API                -> base URL (default https://trading.landrycmd.com)
+  JARVIS_TRADING_MAX_CALLS_PER_MIN  -> client-side rate cap (default 30)
+  # transport
+  HOST (default 0.0.0.0), PORT (default 8080), ALLOW_UNAUTHENTICATED
 
-  - get_fit_score(ticker, opt_type)
-      Directional alignment score (0-10) with sentiment / fundamentals /
-      Kimi-earnings / Kimi-vs-analyst-disagreement / insider components.
-
-  - get_crash_risk()
-      Composite market regime score (0-10) with 6 component breakdown.
-
-  - get_earnings_analysis(ticker)
-      Most recent Kimi-graded SEC 8-K analysis: verdict, bull/bear case,
-      analyst consensus, EPS surprise.
-
-  - get_geopolitical()
-      Multi-region geopolitical risk signal: Ukraine, Iran, China,
-      Tariff, Fed-hawkishness scores 0-10.
-
-Cost: each tool call counted on the server; friends incur no direct $
-cost (Brady absorbs API spend, monitors via /api/admin/usage).
-
-Disclaimer: research and informational only. Not financial advice.
-Brady provides this as a courtesy to friends; no SLA, no guarantees on
-data freshness or correctness, no liability for trading decisions made
-based on outputs.
+Research and informational only. Not financial advice.
 """
-
 from __future__ import annotations
 
-import json
 import os
-import sys
+import threading
 import time
 from collections import deque
-from typing import Any
 from urllib.parse import urljoin
 
-import requests
+import httpx
+from fastmcp import FastMCP
+from fastmcp.server.auth.providers.azure import AzureProvider
 
-# Read at startup; surfaced on first tool call if missing.
-API_BASE  = os.environ.get("JARVIS_TRADING_API", "https://trading.landrycmd.com").rstrip("/")
-API_TOKEN = os.environ.get("JARVIS_TRADING_TOKEN", "")
+API_BASE = os.environ.get("JARVIS_TRADING_API", "https://trading.landrycmd.com").rstrip("/")
 TIMEOUT_S = 90
-
-# Client-side rate limit. Friend's audit (2026-05-10) flagged that a
-# runaway tool-call loop in a Claude session could burn through Brady's
-# upstream API budget AND the friend's per-token quota faster than Brady's
-# server-side limits would catch it. The MCP is the natural place to add
-# a soft client-side ceiling. Defaults: 30 calls per 60 seconds, sliding
-# window. Override via JARVIS_TRADING_MAX_CALLS_PER_MIN env var if
-# legitimately needed (e.g., automated workflows).
 RATE_LIMIT_MAX_CALLS = int(os.environ.get("JARVIS_TRADING_MAX_CALLS_PER_MIN", "30"))
-RATE_LIMIT_WINDOW_S  = 60
+RATE_LIMIT_WINDOW_S = 60
+
+# --- User authentication (Entra OAuth). Enabled only when AUTH_CLIENT_ID is set (deployed). ---
+_auth = None
+if os.environ.get("AUTH_CLIENT_ID"):
+    _auth = AzureProvider(
+        client_id=os.environ["AUTH_CLIENT_ID"],
+        client_secret=os.environ.get("AUTH_CLIENT_SECRET"),
+        tenant_id=os.environ["AUTH_TENANT_ID"],
+        required_scopes=["read"],
+        base_url=os.environ["PUBLIC_BASE_URL"],
+    )
+
+mcp = FastMCP(
+    "Jarvis Trading",
+    instructions=(
+        "Read-only options and market-research tools backed by the Jarvis Trading API. "
+        "Every tool is analysis only: none place orders, move funds, or write anything. "
+        "Cite figures as coming from Jarvis Trading. Research and informational only, not "
+        "financial advice."
+    ),
+    auth=_auth,
+)
+
+
+# --- Backend token: Keychain/env locally, Key Vault via Managed Identity in Azure. Lazy + cached. ---
+_token_cache: str | None = None
+_token_lock = threading.Lock()
+
+
+def _backend_token() -> str:
+    global _token_cache
+    if _token_cache:
+        return _token_cache
+    with _token_lock:
+        if _token_cache:
+            return _token_cache
+        tok = os.environ.get("JARVIS_TRADING_TOKEN")
+        if not tok:
+            kv = os.environ.get("KEY_VAULT_URL")
+            name = os.environ.get("JARVIS_TOKEN_SECRET_NAME")
+            if kv and name:
+                # Imported lazily so local dev needs no azure packages installed.
+                from azure.identity import ManagedIdentityCredential
+                from azure.keyvault.secrets import SecretClient
+                tok = SecretClient(
+                    vault_url=kv, credential=ManagedIdentityCredential()
+                ).get_secret(name).value
+        if not tok:
+            raise RuntimeError(
+                "backend token unavailable: set JARVIS_TRADING_TOKEN (local) or "
+                "KEY_VAULT_URL + JARVIS_TOKEN_SECRET_NAME (Azure)"
+            )
+        _token_cache = tok
+        return _token_cache
+
+
+# --- Client-side rate limiter (sliding window). Locked: the HTTP transport can serve concurrently
+#     (unlike the old stdio loop), so the deque needs a lock. Protects the upstream API budget from
+#     runaway tool-call loops. ---
 _call_history: deque[float] = deque()
+_rate_lock = threading.Lock()
 
 
-def _rate_limit_check() -> dict | None:
-    """Sliding-window rate check. Returns an error dict if the limit is hit;
-    None if the call is allowed (and records the call timestamp).
-
-    Single-process state — there's no concurrent-tool concern in stdio MCPs
-    (Claude calls one tool at a time, awaits the JSON response, then calls
-    the next), so a simple deque is safe without a lock."""
+def _rate_limit_check() -> None:
     now = time.monotonic()
-    cutoff = now - RATE_LIMIT_WINDOW_S
-    while _call_history and _call_history[0] < cutoff:
-        _call_history.popleft()
-    if len(_call_history) >= RATE_LIMIT_MAX_CALLS:
-        oldest = _call_history[0]
-        wait_s = max(0, int(oldest + RATE_LIMIT_WINDOW_S - now))
-        return {
-            "error": (
-                f"Client-side rate limit hit ({RATE_LIMIT_MAX_CALLS} calls per "
-                f"{RATE_LIMIT_WINDOW_S}s). Wait ~{wait_s}s before retrying. "
-                f"This protects Brady's upstream API budget and your token "
-                f"quota from runaway tool-call loops. If you legitimately need "
-                f"a higher rate, set JARVIS_TRADING_MAX_CALLS_PER_MIN in your "
-                f"Claude config's env block."
-            ),
-        }
-    _call_history.append(now)
-    return None
+    with _rate_lock:
+        cutoff = now - RATE_LIMIT_WINDOW_S
+        while _call_history and _call_history[0] < cutoff:
+            _call_history.popleft()
+        if len(_call_history) >= RATE_LIMIT_MAX_CALLS:
+            wait_s = max(0, int(_call_history[0] + RATE_LIMIT_WINDOW_S - now))
+            raise RuntimeError(
+                f"client-side rate limit hit ({RATE_LIMIT_MAX_CALLS}/{RATE_LIMIT_WINDOW_S}s); "
+                f"wait ~{wait_s}s. Protects the upstream API budget from runaway loops. "
+                f"Raise JARVIS_TRADING_MAX_CALLS_PER_MIN if genuinely needed."
+            )
+        _call_history.append(now)
 
 
-# ── Generic API helpers ────────────────────────────────────────────────────
-
-def _api_get(path: str, params: dict | None = None) -> dict:
-    """GET request to the trading API. Surfaces auth errors as a structured
-    response Claude can show the user instead of crashing the MCP server."""
-    if not API_TOKEN:
-        return {
-            "error": (
-                "JARVIS_TRADING_TOKEN env var is not set. Ask Brady for "
-                "your access token, then add it to your Claude config "
-                "under env: { JARVIS_TRADING_TOKEN: \"tok_...\" }."
-            ),
-        }
-    rate_err = _rate_limit_check()
-    if rate_err:
-        return rate_err
-    try:
-        # Use urljoin instead of f-string concatenation. Strictly safer
-        # (handles trailing/leading slashes correctly, validates the
-        # path against the base) and lets static-analysis tools resolve
-        # the destination host from the env-default API_BASE without
-        # flagging the URL as "dynamic". Caller-supplied `path` is hard-
-        # coded by each tool function and never user-controlled, so
-        # there's no injection vector in either form — but urljoin is
-        # the canonical stdlib pattern for "build a URL from a base +
-        # a path" and reads as intent.
-        resp = requests.get(
-            urljoin(API_BASE, path),
-            params=params or {},
-            headers={"X-API-Token": API_TOKEN, "Accept": "application/json"},
-            timeout=TIMEOUT_S,
-        )
-        if resp.status_code == 401:
-            return {"error": "Token rejected. Confirm with Brady that your token is still active."}
-        if resp.status_code != 200:
-            # Don't pass response body verbatim into Claude's context.
-            # Upstream-error text could in theory carry leaked content
-            # (a buggy server, a misconfigured proxy, an attacker-controlled
-            # response on a compromised host). Status code alone is enough
-            # for Claude to surface "the API returned an error" to the user;
-            # if more detail is needed, the user can ping Brady out-of-band.
-            # Friend security audit 2026-05-08 flagged this verbatim
-            # passthrough as low-but-real info-leak risk; sanitized here.
-            return {"error": f"API returned status {resp.status_code}. If this persists, contact Brady."}
-        return resp.json()
-    except requests.Timeout:
-        return {"error": f"Timeout calling {path} (waited {TIMEOUT_S}s)"}
-    except Exception as e:
-        return {"error": f"{type(e).__name__}: {e}"}
+def _api_get(path: str, params: dict | None = None) -> dict | list:
+    """GET the trading API with the X-API-Token header. Read-only; each tool's `path` is
+    hard-coded (never user-controlled). Upstream error bodies are not passed into the model
+    context (info-leak hygiene)."""
+    _rate_limit_check()
+    resp = httpx.get(
+        urljoin(API_BASE + "/", path.lstrip("/")),
+        params=params or {},
+        headers={"X-API-Token": _backend_token(), "Accept": "application/json"},
+        timeout=TIMEOUT_S,
+    )
+    if resp.status_code == 401:
+        raise RuntimeError("trading API rejected the token (401). Confirm the token is still active.")
+    if resp.status_code != 200:
+        raise RuntimeError(f"trading API returned status {resp.status_code}.")
+    return resp.json()
 
 
-# ── Tool implementations ───────────────────────────────────────────────────
-
-def scan_universe(mode: str = "plan_b", budget: float = 75.0, opt_type: str = "call") -> dict:
-    """Scan curated optionable universe. Returns top candidates per hunt mode."""
-    return _api_get("/api/options/scan/universe", {
-        "mode": mode,
-        "budget": budget,
-        "type": opt_type,
-    })
+@mcp.tool
+def scan_universe(mode: str = "plan_b", budget: float = 75.0, opt_type: str = "call") -> dict | list:
+    """Scan the curated ~50-name liquid optionable universe; returns top candidates ranked by
+    fit_score under the chosen hunt mode. mode: plan_b | plan_a | directional. budget: max
+    premium per contract in $. opt_type: call | put."""
+    return _api_get("/api/options/scan/universe", {"mode": mode, "budget": budget, "type": opt_type})
 
 
+@mcp.tool
 def get_thesis(ticker: str, strike: float, expiration: str, opt_type: str = "call") -> dict:
-    """Grok + Kimi A/B thesis for a specific contract. Includes verdict +
-    bull/bear case + exit plan, gated on catalyst window, IV regime, market
-    regime, and directional fit."""
+    """Grok + Kimi thesis for a specific options contract: verdict, bull/bear case, exit plan,
+    gated on catalyst window, IV regime, market regime, and directional fit.
+    expiration: YYYY-MM-DD. opt_type: call | put."""
     return _api_get("/api/options/thesis", {
-        "ticker":     ticker.upper(),
-        "strike":     strike,
-        "expiration": expiration,
-        "type":       opt_type,
+        "ticker": ticker.upper(), "strike": strike, "expiration": expiration, "type": opt_type,
     })
 
 
+@mcp.tool
 def get_fit_score(ticker: str, opt_type: str = "call") -> dict:
-    """Directional fit score (0-10) for ticker + option direction. Returns
-    score + per-component evidence (sentiment, fundamentals, Kimi earnings,
-    Kimi-vs-analyst delta, insider activity)."""
-    # No direct endpoint — the universe scan returns it per candidate. To
-    # get a single ticker, use the thesis endpoint and pull contract.fit_score
-    # from the response. But the cleanest single-ticker call we have is
-    # the screener's directional_fit via the screener endpoint.
+    """Directional fit score (0-10) for a ticker with per-component evidence: sentiment,
+    fundamentals, Kimi earnings, Kimi-vs-analyst delta, insider activity."""
     return _api_get("/api/screener", {"tickers": ticker.upper()})
 
 
+@mcp.tool
 def get_crash_risk() -> dict:
-    """Composite market crash-risk score (0-10) with 6 leading-indicator
-    components. Yield curve, breadth, VIX term, credit spreads, insider
-    selling acceleration, earnings sentiment."""
+    """Composite market crash-risk score (0-10) with 6 leading-indicator components: yield
+    curve, breadth, VIX term structure, credit spreads, insider selling, earnings sentiment."""
     return _api_get("/api/macro/crash-risk")
 
 
+@mcp.tool
 def get_earnings_analysis(ticker: str) -> dict:
-    """Most recent Kimi-graded SEC 8-K analysis for the ticker. Returns a
-    deep-dive analyst take embedded in the kimi_analysis JSON: BUY/HOLD/AVOID
-    verdict + 3-5 sentence verdict_thesis explaining why; conviction
-    HIGH/MEDIUM/LOW; 3-5 paragraph deep_dive narrative; numbers_breakdown
-    (EPS/rev surprise %, margin movement, cash flow); bull/bear case;
-    forward key_catalysts and key_risks arrays; twelve_month_outlook
-    qualitative narrative; analyst-consensus disagreement signal.
-    Empty if Brady's system hasn't analyzed this ticker."""
+    """Most recent Kimi-graded SEC 8-K deep-dive: BUY/HOLD/AVOID verdict + thesis, conviction,
+    deep-dive narrative, numbers breakdown, bull/bear case, forward catalysts/risks, 12-month
+    outlook, analyst-consensus disagreement. Empty if the ticker hasn't been analyzed."""
     return _api_get("/api/macro/earnings-analyses", {"ticker": ticker.upper()})
 
 
+@mcp.tool
 def get_geopolitical() -> dict:
-    """Multi-region geopolitical risk + macro regime signals."""
+    """Multi-region geopolitical risk + macro regime signal: Ukraine, Iran, China-Taiwan,
+    tariff risk, Fed hawkishness, each scored 0-10."""
     return _api_get("/api/macro/political")
 
 
+@mcp.tool
 def get_iv(ticker: str, dte: int = 30) -> dict:
-    """ATM implied vol + realized-vol context for one ticker at the
-    expiration nearest `dte` days out. Free (no LLM cost — pulls from
-    yfinance), cached 5min server-side. Returns spot, expiration, ATM
-    call/put bid/ask/mid/IV/volume/OI/spread, 30d realized vol, RV
-    percentile in 1y history, IV/RV ratio, breakeven % move on the ATM
-    call, and a plain-English summary line. Use this to answer 'is this
-    option expensive' or 'compare option pricing across two tickers'
-    without spending $0.0015/call on get_thesis()."""
+    """ATM implied vol + realized-vol context for one ticker at the expiration nearest `dte`
+    days out. Returns spot, ATM call/put bid/ask/mid/IV/volume/OI/spread, 30d realized vol,
+    RV percentile (1y), IV/RV ratio, breakeven % move on the ATM call, and a summary line.
+    Cheap (no LLM cost, cached 5min) — use for 'is this option expensive' questions."""
     return _api_get("/api/options/iv", {"ticker": ticker.upper(), "dte": int(dte)})
 
 
-# ── MCP protocol implementation (stdio JSON-RPC 2.0) ──────────────────────
-#
-# We implement the bare minimum of MCP needed for Claude Desktop / Claude
-# Code to discover + invoke tools. Avoids the heavier `mcp` SDK so this
-# package has only one runtime dep (requests).
-
-TOOLS = [
-    {
-        "name": "scan_universe",
-        "description": "Scan a curated 50-name liquid optionable universe. Returns top contracts ranked by fit_score, filtered by hunt mode. Use when looking for candidate options trades.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "mode":     {"type": "string", "enum": ["plan_b", "plan_a", "directional"], "default": "plan_b"},
-                "budget":   {"type": "number", "default": 75, "description": "Max premium per contract in $"},
-                "opt_type": {"type": "string", "enum": ["call", "put"], "default": "call"},
-            },
-        },
-    },
-    {
-        "name": "get_thesis",
-        "description": "Grok + Kimi A/B thesis for a specific options contract. Includes verdict, bull/bear case, exit plan. Use when evaluating a single contract you're considering trading.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "ticker":     {"type": "string"},
-                "strike":     {"type": "number"},
-                "expiration": {"type": "string", "description": "YYYY-MM-DD"},
-                "opt_type":   {"type": "string", "enum": ["call", "put"], "default": "call"},
-            },
-            "required": ["ticker", "strike", "expiration"],
-        },
-    },
-    {
-        "name": "get_fit_score",
-        "description": "Directional fit score (0-10) for ticker + direction. Components: sentiment, fundamentals, Kimi earnings, Kimi-vs-analyst disagreement, insider activity.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "ticker":   {"type": "string"},
-                "opt_type": {"type": "string", "enum": ["call", "put"], "default": "call"},
-            },
-            "required": ["ticker"],
-        },
-    },
-    {
-        "name": "get_crash_risk",
-        "description": "Composite market crash-risk score (0-10) with 6 leading-indicator components: yield curve, market breadth, VIX term structure, credit spreads, insider selling, earnings sentiment.",
-        "inputSchema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "get_earnings_analysis",
-        "description": "Most recent Kimi-graded SEC 8-K deep-dive analysis: BUY/HOLD/AVOID verdict + 3-5 sentence verdict_thesis explaining why, conviction (HIGH/MEDIUM/LOW), 3-5 paragraph deep_dive narrative, numbers_breakdown, bull/bear case, forward key_catalysts + key_risks, 12-month qualitative outlook, analyst consensus disagreement signal.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"ticker": {"type": "string"}},
-            "required": ["ticker"],
-        },
-    },
-    {
-        "name": "get_geopolitical",
-        "description": "Multi-region geopolitical risk signal: Ukraine, Iran, China-Taiwan, Tariff risk, Fed hawkishness — each scored 0-10.",
-        "inputSchema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "get_iv",
-        "description": "ATM implied vol + realized-vol context for one ticker. Returns spot, ATM call+put bid/ask/mid/IV/volume/OI/spread at the expiration nearest `dte` days, plus 30d realized vol, RV percentile in 1y history, IV/RV ratio, breakeven % move on the ATM call, and a plain-English summary. Use this for 'is this option expensive' or 'compare option pricing across tickers' questions — free (no LLM cost), cached 5min. Cheaper than get_thesis() when you don't need a full Grok narrative.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "ticker": {"type": "string", "description": "Stock symbol e.g. 'NVDA'"},
-                "dte":    {"type": "integer", "default": 30, "description": "Target days-to-expiry; nearest listed expiration is picked."},
-            },
-            "required": ["ticker"],
-        },
-    },
-]
-
-
-TOOL_FNS = {
-    "scan_universe":         scan_universe,
-    "get_thesis":            get_thesis,
-    "get_fit_score":         get_fit_score,
-    "get_crash_risk":        get_crash_risk,
-    "get_earnings_analysis": get_earnings_analysis,
-    "get_geopolitical":      get_geopolitical,
-    "get_iv":                get_iv,
-}
-
-
-def _send(msg: dict) -> None:
-    """Write a single JSON-RPC message to stdout."""
-    sys.stdout.write(json.dumps(msg) + "\n")
-    sys.stdout.flush()
-
-
-def _handle(msg: dict) -> dict | None:
-    """Process one JSON-RPC request and return the response (or None for
-    notifications). Implements the subset of MCP needed for tool listing
-    + invocation."""
-    method = msg.get("method")
-    msg_id = msg.get("id")
-    params = msg.get("params") or {}
-
-    if method == "initialize":
-        return {
-            "jsonrpc": "2.0",
-            "id": msg_id,
-            "result": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "friend_mcp", "version": "0.1.0"},
-            },
-        }
-
-    if method == "notifications/initialized":
-        return None  # notification, no response expected
-
-    if method == "tools/list":
-        return {"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}}
-
-    if method == "tools/call":
-        name = params.get("name")
-        args = params.get("arguments") or {}
-        fn = TOOL_FNS.get(name)
-        if not fn:
-            return {
-                "jsonrpc": "2.0", "id": msg_id,
-                "error": {"code": -32601, "message": f"Unknown tool: {name}"},
-            }
-        try:
-            result = fn(**args)
-            return {
-                "jsonrpc": "2.0", "id": msg_id,
-                "result": {"content": [{"type": "text", "text": json.dumps(result, indent=2)}]},
-            }
-        except TypeError as e:
-            return {
-                "jsonrpc": "2.0", "id": msg_id,
-                "error": {"code": -32602, "message": f"Invalid params for {name}: {e}"},
-            }
-        except Exception as e:
-            return {
-                "jsonrpc": "2.0", "id": msg_id,
-                "error": {"code": -32603, "message": f"Tool {name} failed: {e}"},
-            }
-
-    # Unknown method — return method-not-found
-    if msg_id is not None:
-        return {
-            "jsonrpc": "2.0", "id": msg_id,
-            "error": {"code": -32601, "message": f"Method not found: {method}"},
-        }
-    return None
-
-
 def main() -> None:
-    """Stdio loop: read JSON-RPC messages line-by-line from stdin, dispatch,
-    write responses to stdout. This is what Claude Desktop / Claude Code
-    drive when the MCP server is added to their config."""
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            msg = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        response = _handle(msg)
-        if response is not None:
-            _send(response)
+    """Start the remote (streamable-http) MCP server. Console-script + `python -m` entrypoint."""
+    host = os.environ.get("HOST", "0.0.0.0")
+    port = int(os.environ.get("PORT", "8080"))
+    # Fail CLOSED: never expose a non-loopback HTTP transport without authentication.
+    if _auth is None and host not in ("127.0.0.1", "localhost") \
+            and os.environ.get("ALLOW_UNAUTHENTICATED") != "1":
+        raise SystemExit(
+            "refusing to start remote HTTP transport without authentication; "
+            "set AUTH_CLIENT_ID, bind HOST=127.0.0.1, or set ALLOW_UNAUTHENTICATED=1 to override"
+        )
+    mcp.run(transport="http", host=host, port=port)
 
 
 if __name__ == "__main__":
