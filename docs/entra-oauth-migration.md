@@ -1,5 +1,14 @@
 # Entra OAuth Migration — landrycmd.com tenant
 
+> **SHIPPED 2026-08-15.** Live at
+> `https://jarvis-trading-mcp.gentlegrass-cc0fcf07.southcentralus.azurecontainerapps.io/mcp`.
+> Remote FastMCP server on Azure Container Apps (gmail subscription), Entra OAuth on the
+> LandryCMD tenant (`219a87a6-df63-4cc3-96b5-c21c3cf769dc`), app `jarvis-trading-mcp-auth`
+> (client `80888d63-f442-4bed-89bf-8ee377f6a11b`, scope `read`), backend token in Key Vault
+> `kv-jarvis-lab2` via Managed Identity. Gotcha that cost time: the app reg needs
+> `api.requestedAccessTokenVersion = 2` or Entra issues v1 tokens FastMCP rejects on issuer
+> mismatch. The checklist below is kept as the historical plan of record.
+
 Goal: replace the static `X-API-Token` model with Microsoft Entra ID OAuth,
 hosted in a **free Entra tenant on landrycmd.com** (separate from the firm's
 acadianatek.com tenant). Personal R&D sandbox; experience transfers to ACADIANA TEK.
