@@ -24,9 +24,9 @@ mailboxes/Office on landrycmd.com.
 - [ ] Confirm Cloudflare is the DNS host for landrycmd.com (it is — Registrar).
 - [ ] Have a Microsoft identity to bootstrap tenant creation. You don't need a
       pre-existing one or an @outlook.com mailbox — sign up free at
-      entra.microsoft.com using your existing Gmail (bjlandry@gmail.com) and
+      entra.microsoft.com using an existing personal email address and
       Microsoft provisions a free Microsoft account during the flow. Not a paid
-      seat. Note: this Gmail-backed account only *births* the tenant; the real
+      seat. Note: this bootstrap account only *births* the tenant; the real
       admin is the `<you>@<tenant>.onmicrosoft.com` Global Admin account created
       with the tenant — use that to run it going forward.
 
