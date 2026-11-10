@@ -2,7 +2,10 @@
 """MCP client checks for the verify skill.
 
 doctor: list tools. Does not call the research API.
-drive: call one tool and confirm the paper backend saw a single GET.
+drive: call one tool and check the upstream rows the paper backend logged for it.
+       Default expectation is one GET, status 200, token last4 "aper". --expect-rows,
+       --expect-error, and --expect-kv-reads describe the 401 reread journeys.
+leakcheck: fail if any full token value appears in any evidence file.
 """
 from __future__ import annotations
 
@@ -82,7 +85,8 @@ async def _list_tools(url: str) -> list[dict]:
 
 async def _call_tool(url: str, name: str, arguments: dict):
     async with Client(url, timeout=30) as client:
-        return await client.call_tool(name, arguments)
+        # Keep tool errors as results so the error journeys can record them.
+        return await client.call_tool(name, arguments, raise_on_error=False)
 
 
 def _write(path: Path, payload) -> None:
@@ -105,7 +109,11 @@ def _paper_body(result) -> dict | None:
     return None
 
 
-def doctor(url: str, evidence: Path, access_log: Path) -> None:
+def _suffix(label: str) -> str:
+    return f"-{label}" if label else ""
+
+
+def doctor(url: str, evidence: Path, access_log: Path, label: str = "") -> None:
     if not access_log.exists():
         raise SystemExit(f"missing paper access log: {access_log}")
     before = _read_jsonl(access_log)
@@ -113,7 +121,7 @@ def doctor(url: str, evidence: Path, access_log: Path) -> None:
     after = _read_jsonl(access_log)
     names = [tool["name"] for tool in tools]
     payload = {"count": len(tools), "tools": tools, "upstream_requests_added": len(after) - len(before)}
-    _write(evidence / "tools.json", payload)
+    _write(evidence / f"tools{_suffix(label)}.json", payload)
     missing = EXPECTED_TOOLS - set(names)
     extra = set(names) - EXPECTED_TOOLS
     forbidden = [name for name in names if any(marker in name.lower() for marker in ORDER_MARKERS)]
@@ -132,76 +140,131 @@ def doctor(url: str, evidence: Path, access_log: Path) -> None:
     print("upstream_requests_added 0")
 
 
-def drive(url: str, evidence: Path, access_log: Path, tool: str, arguments: dict) -> None:
+DEFAULT_ROWS = [{"status": 200, "token_last4": "aper"}]
+
+
+def drive(url: str, evidence: Path, access_log: Path, tool: str, arguments: dict,
+          label: str = "", expect_rows: list[dict] | None = None, expect_error: str = "",
+          kv_log: Path | None = None, expect_kv_reads: int | None = None) -> None:
     if tool not in UPSTREAM_PATH:
         raise SystemExit(f"unknown tool {tool}")
     if not access_log.exists():
         raise SystemExit(f"missing paper access log: {access_log}")
+    if expect_kv_reads is not None and kv_log is None:
+        raise SystemExit("--expect-kv-reads needs --kv-log")
+    expect_rows = expect_rows if expect_rows is not None else DEFAULT_ROWS
     before = _read_jsonl(access_log)
+    kv_before = _read_jsonl(kv_log) if kv_log else []
     result = asyncio.run(_call_tool(url, tool, arguments))
     after = _read_jsonl(access_log)
+    kv_new = (_read_jsonl(kv_log) if kv_log else [])[len(kv_before):]
     new_rows = after[len(before):]
+    texts = _content_text(result)
     call_payload = {
         "tool": tool,
+        "label": label,
         "arguments": arguments,
         "is_error": result.is_error,
         "structured_content": _jsonable(result.structured_content),
         "data": _jsonable(result.data),
-        "text": _content_text(result),
+        "text": texts,
     }
-    _write(evidence / f"call-{tool}.json", call_payload)
-    body = _paper_body(result)
-    paper = body is not None and body.get("paper") is True
-    orders = body.get("orders_placed") if body else None
+    _write(evidence / f"call-{tool}{_suffix(label)}.json", call_payload)
     expected_path = UPSTREAM_PATH[tool]
     paths_ok = bool(new_rows) and all(row.get("path") == expected_path for row in new_rows)
     methods_ok = bool(new_rows) and all(row.get("method") == "GET" for row in new_rows)
-    status_ok = all(row.get("status") == 200 for row in new_rows)
-    token_ok = all(row.get("token_present") is True and row.get("token_last4") == "aper" for row in new_rows)
+    seen = [{"status": row.get("status"), "token_last4": row.get("token_last4")} for row in new_rows]
+    rows_ok = seen == expect_rows
+    if expect_error:
+        body = None
+        paper = None
+        orders = None
+        outcome_ok = result.is_error and any(expect_error in text for text in texts)
+    else:
+        body = _paper_body(result)
+        paper = body is not None and body.get("paper") is True
+        orders = body.get("orders_placed") if body else None
+        outcome_ok = not result.is_error and paper and orders == 0
+    kv_ok = expect_kv_reads is None or len(kv_new) == expect_kv_reads
     side = {
         "tool": tool,
+        "label": label,
         "upstream_path": expected_path,
         "new_requests": new_rows,
+        "expected_rows": expect_rows,
+        "rows_matched": rows_ok,
         "all_get": methods_ok,
         "path_matched": paths_ok,
-        "status_200": status_ok,
-        "paper_token_last4": token_ok,
+        "is_error": result.is_error,
+        "expected_error": expect_error or None,
+        "outcome_matched": outcome_ok,
+        "kv_reads": kv_new if kv_log else None,
+        "expected_kv_reads": expect_kv_reads,
         "paper": paper,
         "orders_placed": orders,
     }
-    _write(evidence / "side-effects.json", side)
-    ok = (
-        not result.is_error
-        and methods_ok
-        and paths_ok
-        and status_ok
-        and token_ok
-        and paper
-        and orders == 0
-        and len(new_rows) == 1
-    )
+    _write(evidence / f"side-effects{_suffix(label)}.json", side)
+    ok = methods_ok and paths_ok and rows_ok and outcome_ok and kv_ok
     print(json.dumps({"ok": ok, **side}, indent=2))
     if not ok:
         raise SystemExit(1)
 
 
+def leakcheck(evidence: Path, tokens: list[str]) -> None:
+    """Every evidence file must be free of each full token value."""
+    hits = []
+    scanned = 0
+    for path in sorted(evidence.rglob("*")):
+        if not path.is_file():
+            continue
+        scanned += 1
+        data = path.read_bytes()
+        for index, token in enumerate(tokens):
+            if token.encode() in data:
+                hits.append({"file": str(path), "token_index": index, "token_last4": token[-4:]})
+    payload = {"files_scanned": scanned, "tokens_checked": [t[-4:] for t in tokens], "hits": hits}
+    _write(evidence / "leakcheck.json", payload)
+    print(json.dumps({"ok": not hits, **payload}, indent=2))
+    if hits or not scanned:
+        raise SystemExit(1)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="List or call jarvis-trading MCP tools")
-    parser.add_argument("command", choices=("doctor", "drive"))
-    parser.add_argument("--url", required=True)
+    parser.add_argument("command", choices=("doctor", "drive", "leakcheck"))
+    parser.add_argument("--url", default="")
     parser.add_argument("--evidence", required=True)
     parser.add_argument("--access-log", default="")
     parser.add_argument("--tool", default="get_crash_risk")
     parser.add_argument("--args", default="{}")
+    parser.add_argument("--label", default="", help="suffix for call-/side-effects-/tools- files")
+    parser.add_argument("--expect-rows", default="",
+                        help='JSON list of {"status", "token_last4"}, one per upstream row')
+    parser.add_argument("--expect-error", default="", help="tool must error with this text")
+    parser.add_argument("--kv-log", default="", help="fake Key Vault read log (JSONL)")
+    parser.add_argument("--expect-kv-reads", type=int, default=None)
+    parser.add_argument("--token", action="append", default=[], help="leakcheck: a full token value")
     args = parser.parse_args()
-    _require_loopback(args.url)
     evidence = Path(args.evidence)
     evidence.mkdir(parents=True, exist_ok=True)
+    if args.command == "leakcheck":
+        if not args.token:
+            raise SystemExit("leakcheck needs at least one --token")
+        leakcheck(evidence, args.token)
+        return
+    _require_loopback(args.url)
     access_log = Path(args.access_log) if args.access_log else evidence / "paper-access.jsonl"
     if args.command == "doctor":
-        doctor(args.url, evidence, access_log)
+        doctor(args.url, evidence, access_log, args.label)
         return
-    drive(args.url, evidence, access_log, args.tool, json.loads(args.args))
+    drive(
+        args.url, evidence, access_log, args.tool, json.loads(args.args),
+        label=args.label,
+        expect_rows=json.loads(args.expect_rows) if args.expect_rows else None,
+        expect_error=args.expect_error,
+        kv_log=Path(args.kv_log) if args.kv_log else None,
+        expect_kv_reads=args.expect_kv_reads,
+    )
 
 
 if __name__ == "__main__":
