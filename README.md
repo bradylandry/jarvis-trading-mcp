@@ -81,7 +81,9 @@ Ask Claude: "what's the current crash risk score?" Claude should call
 - If the connector won't authorize, confirm you accepted the Entra
   invitation and are signing in with that same account.
 - If tools start returning a token error, the server-side backend token
-  has been rotated. That's on Brady's side; ping him.
+  was rotated or revoked. The server rereads it from Key Vault once on a
+  401, so a rotation clears up on its own. If the error sticks, that's on
+  Brady's side; ping him.
 
 ## What you can ask Claude
 

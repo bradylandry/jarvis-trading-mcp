@@ -22,3 +22,6 @@ env/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# test scratch
+.test-fastmcp-home/

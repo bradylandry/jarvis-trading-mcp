@@ -24,6 +24,19 @@ AUTH_CLIENT_SECRET="${AUTH_CLIENT_SECRET:-}"
 AUTH_TENANT_ID="${AUTH_TENANT_ID:-}"               # landrycmd / personal Default Directory tenant id
 # --------------------
 
+# Fail CLOSED on half-set sign-in, before touching Azure. With an empty client secret the server's
+# OAuth signing key would be derived from an empty string.
+if [ -n "$AUTH_CLIENT_ID" ]; then
+  if [ -z "${AUTH_CLIENT_SECRET//[[:space:]]/}" ]; then
+    echo "AUTH_CLIENT_ID is set but AUTH_CLIENT_SECRET is empty; set both (or neither for the first deploy)." >&2
+    exit 1
+  fi
+  if [ -z "${AUTH_TENANT_ID//[[:space:]]/}" ]; then
+    echo "AUTH_CLIENT_ID is set but AUTH_TENANT_ID is empty; set it to the landrycmd tenant id." >&2
+    exit 1
+  fi
+fi
+
 az account set --subscription "$SUBSCRIPTION"
 az group create -n "$RG" -l "$LOCATION" -o none
 az acr create -n "$ACR" -g "$RG" --sku Basic --admin-enabled true -o none
