@@ -49,6 +49,13 @@ RATE_LIMIT_WINDOW_S = 60
 # --- User authentication (Entra OAuth). Enabled only when AUTH_CLIENT_ID is set (deployed). ---
 _auth = None
 if os.environ.get("AUTH_CLIENT_ID"):
+    # Fail CLOSED on half-set sign-in. With an empty secret, FastMCP derives its JWT signing key
+    # and storage key from the empty string, a public value, and still starts.
+    if not (os.environ.get("AUTH_CLIENT_SECRET") or "").strip():
+        raise SystemExit(
+            "refusing to start: AUTH_CLIENT_ID is set but AUTH_CLIENT_SECRET is empty; "
+            "set the client secret or unset AUTH_CLIENT_ID"
+        )
     _auth = AzureProvider(
         client_id=os.environ["AUTH_CLIENT_ID"],
         client_secret=os.environ.get("AUTH_CLIENT_SECRET"),
@@ -74,30 +81,47 @@ _token_cache: str | None = None
 _token_lock = threading.Lock()
 
 
+def _read_token_source() -> str:
+    """Read the backend token from its source. Caller holds _token_lock."""
+    tok = os.environ.get("JARVIS_TRADING_TOKEN")
+    if not tok:
+        kv = os.environ.get("KEY_VAULT_URL")
+        name = os.environ.get("JARVIS_TOKEN_SECRET_NAME")
+        if kv and name:
+            # Imported lazily so local dev needs no azure packages installed.
+            from azure.identity import ManagedIdentityCredential
+            from azure.keyvault.secrets import SecretClient
+            tok = SecretClient(
+                vault_url=kv, credential=ManagedIdentityCredential()
+            ).get_secret(name).value
+    if not tok:
+        raise RuntimeError(
+            "backend token unavailable: set JARVIS_TRADING_TOKEN (local) or "
+            "KEY_VAULT_URL + JARVIS_TOKEN_SECRET_NAME (Azure)"
+        )
+    return tok
+
+
 def _backend_token() -> str:
     global _token_cache
     if _token_cache:
         return _token_cache
     with _token_lock:
-        if _token_cache:
+        if not _token_cache:
+            _token_cache = _read_token_source()
+        return _token_cache
+
+
+def _refresh_backend_token(rejected: str) -> str:
+    """Drop a token the trading API rejected and read the source again (e.g. after a rotation).
+    If another thread already replaced it, use that one instead of reading again. On a read
+    failure nothing stays cached, so the next call tries the source again."""
+    global _token_cache
+    with _token_lock:
+        if _token_cache and _token_cache != rejected:
             return _token_cache
-        tok = os.environ.get("JARVIS_TRADING_TOKEN")
-        if not tok:
-            kv = os.environ.get("KEY_VAULT_URL")
-            name = os.environ.get("JARVIS_TOKEN_SECRET_NAME")
-            if kv and name:
-                # Imported lazily so local dev needs no azure packages installed.
-                from azure.identity import ManagedIdentityCredential
-                from azure.keyvault.secrets import SecretClient
-                tok = SecretClient(
-                    vault_url=kv, credential=ManagedIdentityCredential()
-                ).get_secret(name).value
-        if not tok:
-            raise RuntimeError(
-                "backend token unavailable: set JARVIS_TRADING_TOKEN (local) or "
-                "KEY_VAULT_URL + JARVIS_TOKEN_SECRET_NAME (Azure)"
-            )
-        _token_cache = tok
+        _token_cache = None
+        _token_cache = _read_token_source()
         return _token_cache
 
 
@@ -124,17 +148,31 @@ def _rate_limit_check() -> None:
         _call_history.append(now)
 
 
+def _send(path: str, params: dict | None, token: str) -> httpx.Response:
+    return httpx.get(
+        urljoin(API_BASE + "/", path.lstrip("/")),
+        params=params or {},
+        headers={"X-API-Token": token, "Accept": "application/json"},
+        timeout=TIMEOUT_S,
+    )
+
+
 def _api_get(path: str, params: dict | None = None) -> dict | list:
     """GET the trading API with the X-API-Token header. Read-only; each tool's `path` is
     hard-coded (never user-controlled). Upstream error bodies are not passed into the model
-    context (info-leak hygiene)."""
+    context (info-leak hygiene).
+
+    On a 401 the cached token is dropped and the source reread once (the token may have been
+    rotated in Key Vault). If that gives a different token, the request is retried once; the
+    retry is a real upstream call, so it takes its own rate-limit slot. No loop."""
     _rate_limit_check()
-    resp = httpx.get(
-        urljoin(API_BASE + "/", path.lstrip("/")),
-        params=params or {},
-        headers={"X-API-Token": _backend_token(), "Accept": "application/json"},
-        timeout=TIMEOUT_S,
-    )
+    token = _backend_token()
+    resp = _send(path, params, token)
+    if resp.status_code == 401:
+        fresh = _refresh_backend_token(token)
+        if fresh != token:
+            _rate_limit_check()
+            resp = _send(path, params, fresh)
     if resp.status_code == 401:
         raise RuntimeError("trading API rejected the token (401). Confirm the token is still active.")
     if resp.status_code != 200:

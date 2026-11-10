@@ -165,10 +165,11 @@ echo "evidence kept in $EVIDENCE"
 
 ## Tests, lint, and build
 
-No GitHub Actions workflow, Makefile, pytest suite, or linter is configured. CI runs no test, lint, or build command. Before a PR, compile the package with the venv from Launch:
+No GitHub Actions workflow, Makefile, or linter is configured. CI runs no test, lint, or build command. Before a PR, compile the package and run the unit tests with the venv from Launch. The tests use in-memory fakes for Key Vault and the trading API and a stub `az`, so they make no network or Azure calls:
 
 ```bash
 set -euo pipefail
 .venv/bin/python -m compileall -q friend_mcp
 .venv/bin/python -c "import friend_mcp.server"
+.venv/bin/python -m unittest discover -s tests -t . -v
 ```
