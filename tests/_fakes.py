@@ -33,6 +33,26 @@ class Resp:
         return {"composite": 4.2}
 
 
+_MODULES = ("azure.identity", "azure.keyvault.secrets", "friend_mcp.server")
+
+
+def snapshot():
+    """Save the globals install() replaces, for restore() in tearDown."""
+    return httpx.get, dict(os.environ), {m: sys.modules.get(m) for m in _MODULES}
+
+
+def restore(saved):
+    get, env, mods = saved
+    httpx.get = get
+    os.environ.clear()
+    os.environ.update(env)
+    for m, mod in mods.items():
+        if mod is None:
+            sys.modules.pop(m, None)
+        else:
+            sys.modules[m] = mod
+
+
 def install(world, env=None):
     """Point friend_mcp.server at the fakes and (re)import it, like a fresh process start."""
 

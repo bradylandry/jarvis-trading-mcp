@@ -3,23 +3,17 @@ import os
 import threading
 import unittest
 
-import httpx
-
 from tests import _fakes
-
-_real_get = httpx.get
 
 
 class TokenRefreshTests(unittest.TestCase):
     def setUp(self):
-        self.saved_env = dict(os.environ)
+        self.saved = _fakes.snapshot()
         self.w = _fakes.World()
         self.srv = _fakes.install(self.w)
 
     def tearDown(self):
-        httpx.get = _real_get
-        os.environ.clear()
-        os.environ.update(self.saved_env)
+        _fakes.restore(self.saved)
 
     def rotate(self):
         self.w.vault = self.w.accepted = "tok-two-bbbbbbbb"
@@ -79,11 +73,10 @@ class TokenRefreshTests(unittest.TestCase):
     def test_tokens_never_in_error_messages(self):
         self.srv.get_crash_risk()
         self.w.accepted = "tok-nobody-has-it"
-        try:
+        with self.assertRaises(RuntimeError) as cm:
             self.srv.get_crash_risk()
-        except RuntimeError as e:
-            for t in ("tok-one-aaaaaaaa", "tok-nobody-has-it"):
-                self.assertNotIn(t, str(e))
+        for t in ("tok-one-aaaaaaaa", "tok-nobody-has-it"):
+            self.assertNotIn(t, str(cm.exception))
 
     def test_retry_counts_against_rate_cap(self):
         os.environ["JARVIS_TRADING_MAX_CALLS_PER_MIN"] = "2"
@@ -96,9 +89,20 @@ class TokenRefreshTests(unittest.TestCase):
         self.assertIn("rate limit", str(cm.exception))
         self.assertEqual(len(self.w.sent), 2)
 
-    def test_concurrent_401s_reread_vault_once(self):
-        self.srv.get_crash_risk()
-        self.rotate()
+    def _burst(self, n=20):
+        """Hold every first request until all n have been sent, so the 401s overlap."""
+        barrier = threading.Barrier(n)
+        inner = threading.local()
+        real = _fakes.httpx.get
+
+        def gated(url, params=None, headers=None, timeout=None):
+            resp = real(url, params=params, headers=headers, timeout=timeout)
+            if not getattr(inner, "seen", False):
+                inner.seen = True
+                barrier.wait(timeout=10)
+            return resp
+
+        _fakes.httpx.get = gated
         errors = []
 
         def call():
@@ -107,13 +111,28 @@ class TokenRefreshTests(unittest.TestCase):
             except Exception as e:  # noqa: BLE001
                 errors.append(e)
 
-        ts = [threading.Thread(target=call) for _ in range(20)]
+        ts = [threading.Thread(target=call) for _ in range(n)]
         for t in ts:
             t.start()
         for t in ts:
             t.join()
+        return errors
+
+    def test_concurrent_401s_after_rotation_reread_vault_once(self):
+        self.srv.get_crash_risk()
+        self.rotate()
+        errors = self._burst()
         self.assertEqual(errors, [])
         self.assertEqual(self.w.vault_reads, 2)
+
+    def test_concurrent_401s_with_revoked_token_reread_vault_once(self):
+        self.srv.get_crash_risk()
+        self.w.accepted = "tok-revoked-zzzz"  # vault still has the old token
+        errors = self._burst()
+        self.assertEqual(len(errors), 20)
+        self.assertTrue(all("(401)" in str(e) for e in errors))
+        self.assertEqual(self.w.vault_reads, 2)
+        self.assertEqual(len(self.w.sent), 21)  # no retries with the unchanged token
 
 
 if __name__ == "__main__":

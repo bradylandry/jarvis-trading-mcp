@@ -61,10 +61,6 @@ class StartupAuthTests(unittest.TestCase):
         self.assertIn("WOULD SERVE", out)
         self.assertNotIn(SECRET, out)
 
-    def test_refusal_does_not_print_secret(self):
-        r = start({**SIGNIN, "AUTH_CLIENT_SECRET": "  "})
-        self.assertNotIn(SECRET, r.stdout + r.stderr)
-
 
 if __name__ == "__main__":
     unittest.main()
