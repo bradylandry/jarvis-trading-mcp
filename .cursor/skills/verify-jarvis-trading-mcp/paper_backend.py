@@ -100,6 +100,18 @@ def _fixture(path: str, query: dict[str, list[str]]) -> dict | list:
 class PaperHandler(BaseHTTPRequestHandler):
     access_log_path: str = ""
     expected_token: str = EXPECTED_TOKEN
+    # Rotation scaffolding: when set, the token in this file is also accepted and is
+    # reread on every request, so rewriting the file rotates the accepted token.
+    token_file: str = ""
+
+    def _accepted(self, token: str) -> bool:
+        if token and token == self.expected_token:
+            return True
+        if self.token_file:
+            with open(self.token_file, encoding="utf-8") as handle:
+                rotating = handle.read().strip()
+            return bool(rotating) and token == rotating
+        return False
 
     def log_message(self, fmt: str, *args) -> None:
         # Access lines go to the JSONL file, not stderr.
@@ -143,7 +155,7 @@ class PaperHandler(BaseHTTPRequestHandler):
             self._reject(404, "unknown path; paper backend has no order routes")
             return
         token = self.headers.get("X-API-Token", "")
-        if token != self.expected_token:
+        if not self._accepted(token):
             self._reject(401, "paper token rejected")
             return
         self._send(200, _fixture(parsed.path, parse_qs(parsed.query)))
@@ -170,11 +182,14 @@ def main() -> None:
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--access-log", required=True)
     parser.add_argument("--token", default=EXPECTED_TOKEN)
+    parser.add_argument("--token-file", default="",
+                        help="also accept the token in this file, reread per request")
     args = parser.parse_args()
     if args.host != "127.0.0.1":
         raise SystemExit("paper backend binds 127.0.0.1 only")
     PaperHandler.access_log_path = args.access_log
     PaperHandler.expected_token = args.token
+    PaperHandler.token_file = args.token_file
     open(args.access_log, "a", encoding="utf-8").close()
     server = ThreadingHTTPServer((args.host, args.port), PaperHandler)
     print(f"paper backend ready http://{args.host}:{args.port}", flush=True)
