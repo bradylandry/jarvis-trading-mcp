@@ -39,6 +39,8 @@ UPSTREAM_PATH = {
 }
 
 ORDER_MARKERS = ("order", "buy", "sell")
+# An empty or very short --token would match almost any file.
+MIN_TOKEN_LEN = 8
 
 
 def _require_loopback(url: str) -> None:
@@ -212,6 +214,8 @@ def drive(url: str, evidence: Path, access_log: Path, tool: str, arguments: dict
 
 def leakcheck(evidence: Path, tokens: list[str]) -> None:
     """Every evidence file must be free of each full token value."""
+    if any(len(token) < MIN_TOKEN_LEN for token in tokens):
+        raise SystemExit(f"leakcheck refuses tokens under {MIN_TOKEN_LEN} characters")
     hits = []
     scanned = 0
     for path in sorted(evidence.rglob("*")):

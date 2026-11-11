@@ -66,13 +66,11 @@ set_token "$SCRATCH/kv-secret" "$ROT_NEXT"
 rot --label rot-6-recover --tool get_crash_risk \
   --expect-rows '[{"status":401,"token_last4":"BAD4"},{"status":200,"token_last4":"NEW3"}]' \
   --expect-kv-reads 1
-
-# reread-no-leak
-.venv/bin/python "$SKILL_DIR/mcp_client.py" leakcheck --evidence "$EVIDENCE" \
-  --token "$ROT_OLD" --token "$ROT_NEW" --token "$ROT_NEXT" --token "$ROT_BAD"
 ```
 
-Pass: every `rot` call prints `"ok": true` with `"rows_matched": true` and `"outcome_matched": true`. `side-effects-rot-2-rotated.json` shows the 401 row with `OLD1` followed by the 200 row with `NEW2`, and one `fake-kv-reads.jsonl` row with `value_last4` `NEW2`. `call-get_crash_risk-rot-4-stale-vault.json` and `-rot-5-bad-rotation.json` have `is_error: true` and the exact error text. `leakcheck` prints `"ok": true` with `"hits": []`.
+`reread-no-leak` is checked by the Leak check in SKILL.md, which runs last, after `signin_matrix.py`, so it also scans the sign-in logs.
+
+Pass: every `rot` call prints `"ok": true` with `"rows_matched": true` and `"outcome_matched": true`. `side-effects-rot-2-rotated.json` shows the 401 row with `OLD1` followed by the 200 row with `NEW2`, and one `fake-kv-reads.jsonl` row with `value_last4` `NEW2`. `call-get_crash_risk-rot-4-stale-vault.json` and `-rot-5-bad-rotation.json` have `is_error: true` and the exact error text. The final Leak check prints `"ok": true` with `"hits": []`.
 
 ## Gotchas
 
@@ -80,6 +78,6 @@ Pass: every `rot` call prints `"ok": true` with `"rows_matched": true` and `"out
 - The vault read count includes the first read of a fresh process. A rotation server that has already served a call starts `reread-warm` with a cached token and fails it; relaunch instead of reordering.
 - A reread that returns the same token does not retry, so `reread-stale-vault` logs one row, not two.
 - Each retry takes its own rate-limit slot. This block uses 9 of the default 30 per minute.
-- Run `leakcheck` with the four rotation tokens only. The main server's token `paper` is also a key in every fixture body.
+- The Leak check passes the four rotation tokens and the sign-in placeholder secret, never `paper`: the main server's token `paper` is also a key in every fixture body.
 - If Launch's shadowing check fails, the real Azure SDK would load and try Managed Identity. Do not start the rotation server; fix `PYTHONPATH` first.
 - Concurrent 401s sharing one reread is covered by `tests/test_token_refresh.py` only. Driving it live needs overlapping calls with precise timing, which this harness does not attempt.

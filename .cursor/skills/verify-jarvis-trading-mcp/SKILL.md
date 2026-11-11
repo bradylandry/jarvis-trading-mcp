@@ -36,14 +36,17 @@ unset AUTH_CLIENT_ID AUTH_CLIENT_SECRET AUTH_TENANT_ID PUBLIC_BASE_URL \
   KEY_VAULT_URL JARVIS_TOKEN_SECRET_NAME ALLOW_UNAUTHENTICATED JARVIS_TRADING_TOKEN
 mkdir -p "$EVIDENCE" "$SCRATCH"
 for p in paper mcp rot; do
-  if [ -s "$EVIDENCE/$p.pid" ] && kill -0 "$(cat "$EVIDENCE/$p.pid")" 2>/dev/null; then
+  # our_pid (vars.sh) checks the pid is alive and its command line is ours, so a recycled
+  # pid in a stale pid file is ignored instead of reported.
+  if our_pid "$p" >/dev/null; then
     echo "$p from an earlier run is still up; run Cleanup first" >&2; exit 1
   fi
 done
 # Remove only files this skill wrote on an earlier run. Never rm -rf EVIDENCE: it may be shared.
 rm -f "$EVIDENCE"/{paper,server,rot-server}.log "$EVIDENCE"/{paper,mcp,rot}.pid \
-  "$EVIDENCE"/paper-access.jsonl "$EVIDENCE"/fake-kv-reads.jsonl "$EVIDENCE"/tools*.json \
-  "$EVIDENCE"/call-*.json "$EVIDENCE"/side-effects*.json "$EVIDENCE"/leakcheck.json \
+  "$EVIDENCE"/paper-access.jsonl "$EVIDENCE"/fake-kv-reads.jsonl "$EVIDENCE"/tools{,-rot}.json \
+  "$EVIDENCE"/call-{scan_universe,get_thesis,get_fit_score,get_crash_risk,get_earnings_analysis,get_geopolitical,get_iv}{,-*}.json \
+  "$EVIDENCE"/side-effects{,-*}.json "$EVIDENCE"/leakcheck.json \
   "$EVIDENCE"/signin-*.log "$EVIDENCE"/signin-matrix.json
 # Fail early and by name if another process (another checkout, another agent) holds a port.
 .venv/bin/python - "$PAPER_PORT" "$MCP_PORT" "$ROT_PORT" "$SIGNIN_PORT" <<'PY'
@@ -62,9 +65,11 @@ if busy:
 PY
 set_token "$SCRATCH/paper-token" "$ROT_OLD"
 set_token "$SCRATCH/kv-secret" "$ROT_OLD"
-NOPROXY_ENV=(HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 NO_PROXY=127.0.0.1,localhost)
 
-PYTHONUNBUFFERED=1 .venv/bin/python "$SKILL_DIR/paper_backend.py" \
+# NOCLOUD_ENV and NOPROXY_ENV come from vars.sh. env takes -u options before assignments,
+# so NOCLOUD_ENV (which starts with -u options) always goes first after any other -u.
+env "${NOCLOUD_ENV[@]}" "${NOPROXY_ENV[@]}" PYTHONUNBUFFERED=1 \
+  .venv/bin/python "$SKILL_DIR/paper_backend.py" \
   --host 127.0.0.1 --port "$PAPER_PORT" \
   --access-log "$EVIDENCE/paper-access.jsonl" \
   --token-file "$SCRATCH/paper-token" \
@@ -76,18 +81,19 @@ for _ in $(seq 1 60); do
 done
 grep -q "paper backend ready $API_URL" "$EVIDENCE/paper.log"
 
-env "${NOPROXY_ENV[@]}" PYTHONUNBUFFERED=1 \
+env "${NOCLOUD_ENV[@]}" "${NOPROXY_ENV[@]}" PYTHONUNBUFFERED=1 \
   JARVIS_TRADING_TOKEN=paper JARVIS_TRADING_API="$API_URL" HOST=127.0.0.1 PORT="$MCP_PORT" \
   .venv/bin/python -m friend_mcp.server > "$EVIDENCE/server.log" 2>&1 &
 echo $! > "$EVIDENCE/mcp.pid"
 
 # The rotation server must load the fake SDK, never the real one.
-PYTHONPATH="$PWD/$SKILL_DIR/fake_kv" .venv/bin/python -c '
+env "${NOCLOUD_ENV[@]}" "${NOPROXY_ENV[@]}" \
+  PYTHONPATH="$PWD/$SKILL_DIR/fake_kv" .venv/bin/python -c '
 import azure.identity as i, azure.keyvault.secrets as s
 assert getattr(i.ManagedIdentityCredential, "fake", False), i.__file__
 assert getattr(s.SecretClient, "fake", False), s.__file__
 print("fake key vault shadows azure sdk:", s.__file__)'
-env -u JARVIS_TRADING_TOKEN "${NOPROXY_ENV[@]}" PYTHONUNBUFFERED=1 \
+env -u JARVIS_TRADING_TOKEN "${NOCLOUD_ENV[@]}" "${NOPROXY_ENV[@]}" PYTHONUNBUFFERED=1 \
   PYTHONPATH="$PWD/$SKILL_DIR/fake_kv" \
   KEY_VAULT_URL=https://fake-kv.invalid/ JARVIS_TOKEN_SECRET_NAME=verify-rotation \
   VERIFY_FAKE_KV_FILE="$SCRATCH/kv-secret" VERIFY_FAKE_KV_LOG="$EVIDENCE/fake-kv-reads.jsonl" \
@@ -109,7 +115,7 @@ echo "ready paper=${PAPER_PORT} mcp=${MCP_PORT} rot=${ROT_PORT}"
 
 Readiness is three lines: `paper backend ready http://127.0.0.1:8765` in `paper.log`, then `Uvicorn running on http://127.0.0.1:8080` in `server.log` and `...:8081` in `rot-server.log`. The FastMCP "Starting MCP server" line is wrapped by the rich logger, so do not grep that sentence. If Launch fails partway, run Cleanup before retrying: it kills whichever pid files exist.
 
-Both servers get `HTTP(S)_PROXY` pointed at a closed loopback port with `NO_PROXY=127.0.0.1`, so a stray non-loopback request fails instead of leaving the machine.
+Every process Launch starts gets both cases of `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` pointed at a closed loopback port, with `NO_PROXY` and `no_proxy` set to loopback, so a stray non-loopback request fails instead of leaving the machine. Python prefers the lowercase names, so setting only the uppercase ones is not enough. They also get every inherited `AZURE_*`, `IDENTITY_*`, and `MSI_*` variable removed and `MSI_ENDPOINT`/`IDENTITY_ENDPOINT` set to `http://127.0.0.1:9`, so if the fake Key Vault shadow ever failed, the real Managed Identity credential would hit a dead loopback port instead of a metadata endpoint. `signin_matrix.py` does the same for its children.
 
 ## Doctor
 
@@ -119,7 +125,7 @@ Read-only. Confirms the three processes are ours and alive, the rotation server 
 set -euo pipefail
 . .cursor/skills/verify-jarvis-trading-mcp/vars.sh
 for p in paper mcp rot; do
-  kill -0 "$(cat "$EVIDENCE/$p.pid")" || { echo "$p is not running" >&2; exit 1; }
+  our_pid "$p" >/dev/null || { echo "$p is not running (or its pid is not ours)" >&2; exit 1; }
 done
 if command -v ss >/dev/null; then
   for pp in "paper:$PAPER_PORT" "mcp:$MCP_PORT" "rot:$ROT_PORT"; do
@@ -174,12 +180,28 @@ Pass prints `"ok": true`, `"upstream_path": "/api/macro/crash-risk"`, `"rows_mat
 | `--expect-error TEXT` | The tool must return an error containing `TEXT` (paper body checks are skipped) |
 | `--kv-log F --expect-kv-reads N` | The fake Key Vault must log exactly `N` reads during this call |
 
-`mcp_client.py leakcheck --evidence DIR --token VALUE ...` fails if any full token value appears in any file under `DIR`, and writes `leakcheck.json`. Do not pass `paper`: it is also a fixture key in every body.
+`mcp_client.py leakcheck --evidence DIR --token VALUE ...` fails if any full token value appears in any file under `DIR`, and writes `leakcheck.json`. It refuses tokens shorter than 8 characters, because a short or empty value matches almost any file. Do not pass `paper`: it is also a fixture key in every body.
+
+## Leak check
+
+Run this last, after every feature and `signin_matrix.py`, so it scans every log and evidence file the run wrote: the server logs, the rotation journeys, and every `signin-<case>.log`. It checks the four rotation tokens and the placeholder sign-in secret.
+
+```bash
+set -euo pipefail
+. .cursor/skills/verify-jarvis-trading-mcp/vars.sh
+grep -qF "SECRET = \"$SIGNIN_SECRET\"" "$SKILL_DIR/signin_matrix.py" \
+  || { echo "SIGNIN_SECRET in vars.sh does not match signin_matrix.py" >&2; exit 1; }
+.venv/bin/python "$SKILL_DIR/mcp_client.py" leakcheck --evidence "$EVIDENCE" \
+  --token "$ROT_OLD" --token "$ROT_NEW" --token "$ROT_NEXT" --token "$ROT_BAD" \
+  --token "$SIGNIN_SECRET"
+```
+
+Pass prints `"ok": true` with `"hits": []` and five entries in `tokens_checked`.
 
 ## Repo checks
 
 - Doctor lists the seven tools on both servers.
-- Drive every feature in [features/README.md](features/README.md) through `mcp_client.py`, then run `signin_matrix.py`. No live orders: the server never places one, the paper process rejects non-GET methods and unknown paths, and the client refuses a non-loopback MCP URL.
+- Drive every feature in [features/README.md](features/README.md) through `mcp_client.py`, then run `signin_matrix.py`, then the Leak check. No live orders: the server never places one, the paper process rejects non-GET methods and unknown paths, and the client refuses a non-loopback MCP URL.
 - Run the unit tests (last section).
 
 ## Evidence
@@ -196,7 +218,7 @@ Saved under `$EVIDENCE`:
 | `side-effects[-label].json` | The new upstream rows, the expected rows, Key Vault reads, and pass flags |
 | `leakcheck.json` | Files scanned and any full-token hits (must be none) |
 | `signin-matrix.json`, `signin-<case>.log` | One startup per sign-in combination: exit code, refusal line, traceback flag |
-| `paper.pid`, `mcp.pid`, `rot.pid` | Processes Cleanup is allowed to kill |
+| `paper.pid`, `mcp.pid`, `rot.pid`, `signin.pid` | Processes Cleanup may kill (SIGTERM, then SIGKILL after 4s), after it confirms each pid is alive and its command line is `paper_backend.py` or `friend_mcp.server` on this run's port. Cleanup removes each one once its process is gone |
 
 Proof standards:
 
@@ -208,29 +230,45 @@ Proof standards:
 
 ## Cleanup
 
-Kills only the processes in the pid files, removes `$SCRATCH` (token files), and keeps `$EVIDENCE`.
+Kills only the processes in the pid files that are still alive and still ours (checked by command line and port, so a recycled pid is never signaled), removes their pid files, removes `$SCRATCH` (token files), and keeps `$EVIDENCE`. Safe to run again later.
 
 ```bash
 set -uo pipefail
 . .cursor/skills/verify-jarvis-trading-mcp/vars.sh
-for p in mcp rot paper; do
-  [ -s "$EVIDENCE/$p.pid" ] && kill "$(cat "$EVIDENCE/$p.pid")" 2>/dev/null
+# Signal a pid only after our_pid (vars.sh) confirms it is alive and its command line is
+# paper_backend.py or friend_mcp.server on this run's port. A stale pid file is never trusted.
+status=0
+# signin.pid is a sign-in matrix child left behind if the matrix itself was killed.
+for p in mcp rot paper signin; do
+  pid=$(our_pid "$p") && kill "$pid" 2>/dev/null
 done
 for _ in $(seq 1 40); do
   alive=0
-  for p in mcp rot paper; do
-    [ -s "$EVIDENCE/$p.pid" ] && kill -0 "$(cat "$EVIDENCE/$p.pid")" 2>/dev/null && alive=1
+  for p in mcp rot paper signin; do
+    our_pid "$p" >/dev/null && alive=1
   done
   [ "$alive" = 0 ] && break
   sleep 0.1
 done
-status=0
-for p in mcp rot paper; do
-  if [ -s "$EVIDENCE/$p.pid" ] && kill -0 "$(cat "$EVIDENCE/$p.pid")" 2>/dev/null; then
-    echo "$p still running (pid $(cat "$EVIDENCE/$p.pid"))" >&2; status=1
+# Still ours after 4s: SIGKILL, then check once more below.
+for p in mcp rot paper signin; do
+  pid=$(our_pid "$p") && kill -9 "$pid" 2>/dev/null
+done
+sleep 0.5
+for p in mcp rot paper signin; do
+  if pid=$(our_pid "$p"); then
+    echo "$p still running (pid $pid)" >&2; status=1
+  else
+    rm -f "$EVIDENCE/$p.pid"  # confirmed gone (or never ours); a stale file must not outlive it
   fi
 done
-case "$SCRATCH" in /tmp/verify-jarvis-trading-mcp-scratch-*) rm -rf "$SCRATCH" ;; esac
+case "$SCRATCH" in
+  *..*|/tmp/verify-jarvis-trading-mcp-scratch-*/*)
+    echo "refusing to remove SCRATCH=$SCRATCH; token files left in place" >&2; status=1 ;;
+  /tmp/verify-jarvis-trading-mcp-scratch-?*) rm -rf "$SCRATCH" ;;
+  *) echo "SCRATCH=$SCRATCH is outside /tmp/verify-jarvis-trading-mcp-scratch-*; token files left in place" >&2
+     status=1 ;;
+esac
 for f in tools.json call-get_crash_risk.json side-effects.json paper-access.jsonl; do
   test -s "$EVIDENCE/$f" || { echo "missing evidence $f" >&2; status=1; }
 done
@@ -247,6 +285,9 @@ set -euo pipefail
 .venv/bin/python -m compileall -q friend_mcp
 .venv/bin/python -c "import friend_mcp.server"
 .venv/bin/python -m unittest discover -s tests -t . -v
+# The skill's own scaffolding: the fake Key Vault guard and leakcheck.
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m unittest discover \
+  -s .cursor/skills/verify-jarvis-trading-mcp/tests -v
 ```
 
 The unit tests call the token helpers in-process. They do not replace the live journeys in [token-reread](features/token-reread.md) and [signin-guard](features/signin-guard.md), which go through a real server process.
