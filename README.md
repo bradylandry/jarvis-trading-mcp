@@ -268,6 +268,15 @@ to avoid leaking upstream content into your context.
   wiring the Managed Identity to Key Vault and the OAuth env to the login
   tenant. The full setup runbook (tenant, app registration, the
   `requestedAccessTokenVersion=2` gotcha) lives in Brady's notes.
+- Older deploys created a registry named `acrjarvismcp` plus a random
+  suffix and attached it to the app with the registry admin password.
+  `deploy.sh` does not delete those. After the new revision is healthy,
+  remove them once by hand:
+
+  ```bash
+  az containerapp registry remove -n jarvis-trading-mcp -g rg-jarvis-mcp --server <old-registry>.azurecr.io
+  az acr delete -n <old-registry-name> -g rg-jarvis-mcp --yes
+  ```
 - Deps are pinned in `requirements.txt` / `pyproject.toml`: `fastmcp`,
   `httpx`, `azure-identity`, `azure-keyvault-secrets`.
 
