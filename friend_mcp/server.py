@@ -8,7 +8,8 @@ desktop / mobile behind Entra OAuth.
 Auth model:
   - Client -> this server: Entra OAuth (AzureProvider), the *landrycmd* tenant. Enabled only
     when AUTH_CLIENT_ID is set (i.e. in the deployed Container App); omitted locally so
-    loopback dev runs without a token. Fails CLOSED on a public bind (see main()).
+    loopback dev runs without a token. Fails CLOSED on a public bind (see main()), and on any
+    half-set sign-in config (some of the four settings below set without the rest).
   - This server -> trading API: static X-API-Token, sourced from macOS Keychain (local, via
     JARVIS_TRADING_TOKEN set by run-local.sh) or Azure Key Vault via Managed Identity (in
     Azure). Never written to disk.
@@ -53,6 +54,7 @@ def _env(name: str) -> str:
 
 
 # --- User authentication (Entra OAuth). Enabled only when AUTH_CLIENT_ID is set (deployed). ---
+# Any half-set sign-in config (some of the four settings set without the rest) refuses to start.
 _auth = None
 if _env("AUTH_CLIENT_ID"):
     # Fail CLOSED on half-set sign-in. With an empty secret, FastMCP derives its JWT signing key
@@ -69,11 +71,11 @@ if _env("AUTH_CLIENT_ID"):
             "set the missing settings or unset AUTH_CLIENT_ID"
         )
     _auth = AzureProvider(
-        client_id=os.environ["AUTH_CLIENT_ID"],
-        client_secret=os.environ.get("AUTH_CLIENT_SECRET"),
-        tenant_id=os.environ["AUTH_TENANT_ID"],
+        client_id=_env("AUTH_CLIENT_ID"),
+        client_secret=_env("AUTH_CLIENT_SECRET"),
+        tenant_id=_env("AUTH_TENANT_ID"),
         required_scopes=["read"],
-        base_url=os.environ["PUBLIC_BASE_URL"],
+        base_url=_env("PUBLIC_BASE_URL"),
     )
 else:
     _set = [k for k in ("AUTH_CLIENT_SECRET", "AUTH_TENANT_ID", "PUBLIC_BASE_URL") if _env(k)]

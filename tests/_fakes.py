@@ -84,7 +84,8 @@ def install(world, env=None):
 
     httpx.get = fake_get
 
-    for k in ("JARVIS_TRADING_TOKEN", "AUTH_CLIENT_ID", "AUTH_CLIENT_SECRET"):
+    for k in ("JARVIS_TRADING_TOKEN", "AUTH_CLIENT_ID", "AUTH_CLIENT_SECRET",
+              "AUTH_TENANT_ID", "PUBLIC_BASE_URL"):
         os.environ.pop(k, None)
     os.environ.update(
         KEY_VAULT_URL="https://fake-vault.invalid/",
