@@ -11,6 +11,8 @@ set -euo pipefail
 
 # ---- fill these ----
 SUBSCRIPTION="Azure subscription 1 - gmail"      # the credits subscription
+# kv-jarvis-lab2 may live outside that subscription. Export KV_SUBSCRIPTION to override.
+KV_SUBSCRIPTION="${KV_SUBSCRIPTION:-$SUBSCRIPTION}"
 RG="rg-jarvis-mcp"
 LOCATION="southcentralus"
 # Stable across re-runs so a later deploy builds into the same registry.
@@ -26,7 +28,7 @@ AUTH_KV_SECRET="jarvis-trading-auth-client-secret"
 KV_NAME="${KV_URL#https://}"
 KV_NAME="${KV_NAME%%/*}"
 KV_NAME="${KV_NAME%%.vault.*}"
-# OAuth (landrycmd tenant) — set AFTER you register the app (leave blank for first deploy):
+# OAuth (landrycmd tenant). Set AFTER you register the app (leave blank for first deploy):
 AUTH_CLIENT_ID="${AUTH_CLIENT_ID:-}"
 AUTH_CLIENT_SECRET="${AUTH_CLIENT_SECRET:-}"
 AUTH_TENANT_ID="${AUTH_TENANT_ID:-}"               # landrycmd / personal Default Directory tenant id
@@ -44,15 +46,18 @@ if [ -n "$AUTH_CLIENT_ID" ]; then
     exit 1
   fi
 fi
+# Keep the value in this shell for the printf below. Child processes, including
+# az acr build, must not inherit it.
+export -n AUTH_CLIENT_SECRET
 
 AUTH_SECRET_FILE=""
-CREATE_ERR=""
+SHOW_ERR=""
 cleanup() {
   if [ -n "${AUTH_SECRET_FILE:-}" ]; then
     rm -f "$AUTH_SECRET_FILE"
   fi
-  if [ -n "${CREATE_ERR:-}" ]; then
-    rm -f "$CREATE_ERR"
+  if [ -n "${SHOW_ERR:-}" ]; then
+    rm -f "$SHOW_ERR"
   fi
 }
 trap cleanup EXIT
@@ -82,42 +87,143 @@ grant_role() {
   exit 1
 }
 
-IMAGE="$ACR.azurecr.io/$APP:latest"
+# Azure CLI exits 3 for ResourceNotFound. Any other failure is printed and stops
+# the script, so a transient error is not treated as "missing, create it".
+show_or_missing() {
+  local rc=0
+  SHOW_ERR=$(mktemp)
+  "$@" >"$SHOW_ERR" 2>&1 || rc=$?
+  if [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ]; then
+    rm -f "$SHOW_ERR"
+    SHOW_ERR=""
+    return "$rc"
+  fi
+  cat "$SHOW_ERR" >&2
+  rm -f "$SHOW_ERR"
+  SHOW_ERR=""
+  exit 1
+}
+
+# runningState, not provisioningState. Provisioned only means the revision object
+# was accepted. Failed, Degraded, and ActivationFailed stop the deploy.
+wait_for_running_revision() {
+  local rev="$1"
+  local state="" try=0
+  rev="${rev//[[:space:]]/}"
+  if [ -z "$rev" ]; then
+    echo "latest revision name is empty; not treating the deploy as healthy" >&2
+    exit 1
+  fi
+  # 36 * 5s is about three minutes. Activating is not a failure yet.
+  while [ "$try" -lt 36 ]; do
+    try=$((try + 1))
+    if ! state="$(az containerapp revision show -n "$APP" -g "$RG" --revision "$rev" \
+        --query properties.runningState -o tsv)"; then
+      echo "could not read runningState for revision $rev" >&2
+      exit 1
+    fi
+    state="${state//[[:space:]]/}"
+    case "$state" in
+      Running)
+        return 0
+        ;;
+      Failed|Degraded|ActivationFailed)
+        echo "revision $rev is $state" >&2
+        exit 1
+        ;;
+    esac
+    sleep 5
+  done
+  echo "revision $rev did not reach Running (last: ${state:-empty})" >&2
+  exit 1
+}
+
+# The first create uses the registry admin user so that pull does not wait on
+# AcrPull to propagate. Once this revision is Running on the system identity,
+# turn admin off and drop the password create stored on the app.
+# az names that secret <server>-<username> with the dots removed.
+finish_registry_access() {
+  local pw_secret names
+  az acr update -n "$ACR" --admin-enabled false -o none
+  pw_secret="$(printf '%s' "${ACR}.azurecr.io-${ACR}" | tr -d '.' | tr '[:upper:]' '[:lower:]')"
+  names="$(az containerapp secret list -n "$APP" -g "$RG" --query '[].name' -o tsv)"
+  if printf '%s\n' "$names" | grep -Fxq "$pw_secret"; then
+    az containerapp secret remove -n "$APP" -g "$RG" --secret-names "$pw_secret" -o none
+  fi
+}
+
+# A brand-new Key Vault Secrets User grant is often not visible yet. Retry only
+# on the RBAC path. An access-policy vault fails on the first error.
+set_auth_secret_ref() {
+  local try=0 err
+  while [ "$try" -lt 5 ]; do
+    try=$((try + 1))
+    err=$(mktemp)
+    if az containerapp secret set -n "$APP" -g "$RG" \
+        --secrets "auth-client-secret=keyvaultref:${KV_URL%/}/secrets/${AUTH_KV_SECRET},identityref:system" \
+        -o none >"$err" 2>&1; then
+      rm -f "$err"
+      return 0
+    fi
+    cat "$err" >&2
+    rm -f "$err"
+    if [ "$KV_RBAC" -ne 1 ] || [ "$try" -eq 5 ]; then
+      if [ "$KV_RBAC" -eq 1 ]; then
+        echo "containerapp secret set failed after retries. A new Key Vault Secrets User grant can take a few minutes to apply. Re-run once it is visible." >&2
+      else
+        echo "containerapp secret set failed" >&2
+      fi
+      exit 1
+    fi
+    sleep "$try"
+  done
+}
+
+# A new tag every run, including sub-second digits so two deploys in the same
+# second still differ. Container Apps does not start a revision when the image
+# string is unchanged, so deploying :latest again can leave the old digest running.
+# :latest is still published. The app is updated to this unique tag.
+TAG="$(date -u +%Y%m%d%H%M%S%N)"
+IMAGE="$ACR.azurecr.io/$APP:$TAG"
 
 az account set --subscription "$SUBSCRIPTION"
 az group create -n "$RG" -l "$LOCATION" -o none
-# Create the registry once. A later run reuses it and still builds :latest.
-if ! az acr show -n "$ACR" -g "$RG" -o none 2>/dev/null; then
+acr_rc=0
+show_or_missing az acr show -n "$ACR" -g "$RG" -o none || acr_rc=$?
+if [ "$acr_rc" -eq 3 ]; then
+  # Admin stays on for this first create. finish_registry_access turns it off
+  # after the system-identity revision is Running.
   az acr create -n "$ACR" -g "$RG" --sku Basic --admin-enabled true -o none
+elif [ "$acr_rc" -ne 0 ]; then
+  echo "az acr show failed (exit $acr_rc)" >&2
+  exit 1
 fi
-az acr build -r "$ACR" -t "$APP:latest" .
+az acr build -r "$ACR" -t "$APP:$TAG" -t "$APP:latest" .
 
 az containerapp env create -n "$ENVN" -g "$RG" -l "$LOCATION" -o none 2>/dev/null || true
 
-# First create/update WITHOUT auth to obtain the FQDN, then re-run with AUTH_* set.
-# Keep going only when this name is already taken. Any other create error stops
-# the script before registry changes or the image update.
-CREATE_ERR=$(mktemp)
-if ! az containerapp create -n "$APP" -g "$RG" --environment "$ENVN" \
-  --image "$IMAGE" \
-  --registry-server "$ACR.azurecr.io" \
-  --ingress external --target-port 8080 \
-  --min-replicas 1 --max-replicas 1 \
-  --system-assigned \
-  --env-vars \
-    JARVIS_TRADING_API=https://trading.landrycmd.com \
-    KEY_VAULT_URL="$KV_URL" \
-    JARVIS_TOKEN_SECRET_NAME="$KV_SECRET" \
-  -o none 2>"$CREATE_ERR"; then
-  if grep -Eqi 'ContainerAppAlreadyExists|already exists' "$CREATE_ERR"; then
-    echo "app exists; updating below"
-  else
-    cat "$CREATE_ERR" >&2
-    exit 1
-  fi
+# Create only when show says the app is missing (exit 3). Any other show error
+# already stopped the script. Do not infer existence from create's error text.
+app_rc=0
+show_or_missing az containerapp show -n "$APP" -g "$RG" -o none || app_rc=$?
+if [ "$app_rc" -eq 0 ]; then
+  echo "app exists; updating below"
+elif [ "$app_rc" -eq 3 ]; then
+  az containerapp create -n "$APP" -g "$RG" --environment "$ENVN" \
+    --image "$IMAGE" \
+    --registry-server "$ACR.azurecr.io" \
+    --ingress external --target-port 8080 \
+    --min-replicas 1 --max-replicas 1 \
+    --system-assigned \
+    --env-vars \
+      JARVIS_TRADING_API=https://trading.landrycmd.com \
+      KEY_VAULT_URL="$KV_URL" \
+      JARVIS_TOKEN_SECRET_NAME="$KV_SECRET" \
+    -o none
+else
+  echo "az containerapp show failed (exit $app_rc)" >&2
+  exit 1
 fi
-rm -f "$CREATE_ERR"
-CREATE_ERR=""
 
 FQDN=$(az containerapp show -n "$APP" -g "$RG" --query properties.configuration.ingress.fqdn -o tsv)
 echo "App URL: https://$FQDN   (redirect URI: https://$FQDN/auth/callback)"
@@ -144,14 +250,14 @@ fi
 
 # Access-policy vaults take set-policy. RBAC vaults reject set-policy, so grant
 # Key Vault Secrets User on this one secret. RoleAssignmentExists is a successful rerun.
-RBAC=$(az keyvault show -n "$KV_NAME" --query properties.enableRbacAuthorization -o tsv)
+RBAC=$(az keyvault show -n "$KV_NAME" --subscription "$KV_SUBSCRIPTION" --query properties.enableRbacAuthorization -o tsv)
 RBAC="${RBAC//[[:space:]]/}"
 KV_RBAC=0
 case "$RBAC" in
   true|True|TRUE) KV_RBAC=1 ;;
 esac
 if [ "$KV_RBAC" -eq 1 ]; then
-  VAULT_ID=$(az keyvault show -n "$KV_NAME" --query id -o tsv)
+  VAULT_ID=$(az keyvault show -n "$KV_NAME" --subscription "$KV_SUBSCRIPTION" --query id -o tsv)
   VAULT_ID="${VAULT_ID//[[:space:]]/}"
   if [ -z "$VAULT_ID" ]; then
     echo "key vault id is empty; cannot assign Key Vault Secrets User" >&2
@@ -159,7 +265,7 @@ if [ "$KV_RBAC" -eq 1 ]; then
   fi
   grant_role "$PID" "Key Vault Secrets User" "${VAULT_ID}/secrets/${KV_SECRET}"
 else
-  az keyvault set-policy --name "$KV_NAME" --object-id "$PID" --secret-permissions get
+  az keyvault set-policy --name "$KV_NAME" --subscription "$KV_SUBSCRIPTION" --object-id "$PID" --secret-permissions get -o none
 fi
 
 # The client secret goes to Key Vault before any image change. It is not an az argument.
@@ -168,15 +274,13 @@ if [ -n "$AUTH_CLIENT_ID" ]; then
   chmod 600 "$AUTH_SECRET_FILE"
   printf '%s' "$AUTH_CLIENT_SECRET" > "$AUTH_SECRET_FILE"
   unset AUTH_CLIENT_SECRET
-  az keyvault secret set --vault-name "$KV_NAME" --name "$AUTH_KV_SECRET" --file "$AUTH_SECRET_FILE" -o none
+  az keyvault secret set --vault-name "$KV_NAME" --subscription "$KV_SUBSCRIPTION" --name "$AUTH_KV_SECRET" --file "$AUTH_SECRET_FILE" -o none
   rm -f "$AUTH_SECRET_FILE"
   AUTH_SECRET_FILE=""
   if [ "$KV_RBAC" -eq 1 ]; then
     grant_role "$PID" "Key Vault Secrets User" "${VAULT_ID}/secrets/${AUTH_KV_SECRET}"
   fi
-  az containerapp secret set -n "$APP" -g "$RG" \
-    --secrets "auth-client-secret=keyvaultref:${KV_URL%/}/secrets/${AUTH_KV_SECRET},identityref:system" \
-    -o none
+  set_auth_secret_ref
 fi
 
 # Pull with the system identity. Do not pass the ACR admin password on argv.
@@ -197,8 +301,9 @@ az containerapp registry set -n "$APP" -g "$RG" \
 # Point the running app at the image this run just built.
 # One --set-env-vars list: update merges those pairs and leaves the rest.
 # --replace-env-vars would clear the list first and keep only its own pairs.
+REV=""
 if [ -n "$AUTH_CLIENT_ID" ]; then
-  az containerapp update -n "$APP" -g "$RG" \
+  REV="$(az containerapp update -n "$APP" -g "$RG" \
     --image "$IMAGE" \
     --set-env-vars \
       JARVIS_TRADING_API=https://trading.landrycmd.com \
@@ -208,16 +313,21 @@ if [ -n "$AUTH_CLIENT_ID" ]; then
       AUTH_TENANT_ID="$AUTH_TENANT_ID" \
       PUBLIC_BASE_URL="https://$FQDN" \
       AUTH_CLIENT_SECRET=secretref:auth-client-secret \
-    -o none
-  echo "auth enabled; connect from Claude at https://$FQDN/mcp"
+    --query properties.latestRevisionName -o tsv)"
 else
   # A previous --replace-env-vars wipe drops these. Set them again and leave AUTH_* in place.
-  az containerapp update -n "$APP" -g "$RG" \
+  REV="$(az containerapp update -n "$APP" -g "$RG" \
     --image "$IMAGE" \
     --set-env-vars \
       JARVIS_TRADING_API=https://trading.landrycmd.com \
       KEY_VAULT_URL="$KV_URL" \
       JARVIS_TOKEN_SECRET_NAME="$KV_SECRET" \
-    -o none
+    --query properties.latestRevisionName -o tsv)"
+fi
+wait_for_running_revision "$REV"
+finish_registry_access
+if [ -n "$AUTH_CLIENT_ID" ]; then
+  echo "auth enabled; connect from Claude at https://$FQDN/mcp"
+else
   echo "NEXT: register the app in the landrycmd tenant with redirect https://$FQDN/auth/callback, then re-run with AUTH_* set."
 fi
