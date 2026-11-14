@@ -80,6 +80,10 @@ mcp = FastMCP(
 _token_cache: str | None = None
 _token_gen = 0  # bumped on every successful read, so concurrent 401s share one reread
 _token_lock = threading.Lock()
+# One failed reread per rejected generation. Overlapping callers raise it instead of
+# reading again. The cache stays empty, so this is not a cached token and the next call reads again.
+_failed_reread_gen: int | None = None
+_failed_reread_error: Exception | None = None
 
 
 def _read_token_source() -> str:
@@ -113,18 +117,36 @@ def _backend_token() -> tuple[str, int]:
         return _token_cache, _token_gen
 
 
+def _copy_error(err: Exception) -> Exception:
+    """A new exception with the same type and message, so threads do not share one instance."""
+    try:
+        return type(err)(str(err))
+    except Exception:
+        return RuntimeError(str(err))
+
+
 def _refresh_backend_token(rejected_gen: int) -> tuple[str, int]:
     """Drop a token the trading API rejected and read the source again (e.g. after a rotation).
     If another thread already reread since the rejected token was handed out, use its result
-    instead of reading again, so a burst of 401s costs one Key Vault read. On a read failure
-    nothing stays cached, so the next call tries the source again."""
-    global _token_cache, _token_gen
+    instead of reading again, so a burst of 401s costs one Key Vault read. A failed reread is
+    shared the same way and is not stored as a token, so the next call tries the source again."""
+    global _token_cache, _token_gen, _failed_reread_gen, _failed_reread_error
     with _token_lock:
         if _token_cache and _token_gen != rejected_gen:
             return _token_cache, _token_gen
+        if _failed_reread_gen == rejected_gen and _failed_reread_error is not None:
+            raise _copy_error(_failed_reread_error)
         _token_cache = None
-        _token_cache = _read_token_source()
+        try:
+            tok = _read_token_source()
+        except Exception as e:
+            _failed_reread_gen = rejected_gen
+            _failed_reread_error = e
+            raise
+        _token_cache = tok
         _token_gen += 1
+        _failed_reread_gen = None
+        _failed_reread_error = None
         return _token_cache, _token_gen
 
 

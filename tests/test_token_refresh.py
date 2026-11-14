@@ -112,11 +112,14 @@ class TokenRefreshTests(unittest.TestCase):
                 errors.append(e)
 
         ts = [threading.Thread(target=call) for _ in range(n)]
-        for t in ts:
-            t.start()
-        for t in ts:
-            t.join()
-        return errors
+        try:
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+            return errors
+        finally:
+            _fakes.httpx.get = real
 
     def test_concurrent_401s_after_rotation_reread_vault_once(self):
         self.srv.get_crash_risk()
@@ -133,6 +136,30 @@ class TokenRefreshTests(unittest.TestCase):
         self.assertTrue(all("(401)" in str(e) for e in errors))
         self.assertEqual(self.w.vault_reads, 2)
         self.assertEqual(len(self.w.sent), 21)  # no retries with the unchanged token
+
+    def test_concurrent_401s_share_one_failed_vault_reread(self):
+        self.srv.get_crash_risk()
+        self.rotate()
+        self.w.vault_up = False
+        errors = self._burst()
+        self.assertEqual(len(errors), 20)
+        self.assertTrue(all(isinstance(e, RuntimeError) for e in errors))
+        self.assertTrue(all("vault unreachable" in str(e) for e in errors))
+        for e in errors:
+            self.assertNotIn("tok-one-aaaaaaaa", str(e))
+            self.assertNotIn("tok-two-bbbbbbbb", str(e))
+        # prime read plus one failed reread, shared by the rest of the burst
+        self.assertEqual(self.w.vault_reads, 2)
+        self.assertIsNone(self.srv._token_cache)
+        # the failure is not a cached token: the next call reads the vault again
+        with self.assertRaises(RuntimeError):
+            self.srv.get_crash_risk()
+        self.assertEqual(self.w.vault_reads, 3)
+        self.assertIsNone(self.srv._token_cache)
+        self.w.vault_up = True
+        self.assertEqual(self.srv.get_crash_risk(), {"composite": 4.2})
+        self.assertEqual(self.w.vault_reads, 4)
+        self.assertEqual(self.w.sent[-1], "tok-two-bbbbbbbb")
 
 
 if __name__ == "__main__":

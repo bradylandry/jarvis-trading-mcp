@@ -13,11 +13,17 @@ set -euo pipefail
 SUBSCRIPTION="Azure subscription 1 - gmail"      # the credits subscription
 RG="rg-jarvis-mcp"
 LOCATION="southcentralus"
-ACR="acrjarvismcp$RANDOM"                          # must be globally unique, lowercase
+# Stable across re-runs so a later deploy builds into the same registry.
+# Override ACR_NAME if that name is already taken globally (5-50 lowercase letters and digits).
+ACR="${ACR_NAME:-acrjarvismcp}"
 ENVN="cae-jarvis-mcp"
 APP="jarvis-trading-mcp"
 KV_URL="https://kv-jarvis-lab2.vault.azure.net/"   # existing Key Vault
 KV_SECRET="jarvis-trading-token"                    # secret holding the X-API-Token
+# set-policy --name is the vault name, not the host.
+KV_NAME="${KV_URL#https://}"
+KV_NAME="${KV_NAME%%/*}"
+KV_NAME="${KV_NAME%%.vault.*}"
 # OAuth (landrycmd tenant) — set AFTER you register the app (leave blank for first deploy):
 AUTH_CLIENT_ID="${AUTH_CLIENT_ID:-}"
 AUTH_CLIENT_SECRET="${AUTH_CLIENT_SECRET:-}"
@@ -37,16 +43,21 @@ if [ -n "$AUTH_CLIENT_ID" ]; then
   fi
 fi
 
+IMAGE="$ACR.azurecr.io/$APP:latest"
+
 az account set --subscription "$SUBSCRIPTION"
 az group create -n "$RG" -l "$LOCATION" -o none
-az acr create -n "$ACR" -g "$RG" --sku Basic --admin-enabled true -o none
-az acr build -r "$ACR" -t "$APP:latest" . 
+# Create the registry once. A later run reuses it and still builds :latest.
+if ! az acr show -n "$ACR" -g "$RG" -o none 2>/dev/null; then
+  az acr create -n "$ACR" -g "$RG" --sku Basic --admin-enabled true -o none
+fi
+az acr build -r "$ACR" -t "$APP:latest" .
 
 az containerapp env create -n "$ENVN" -g "$RG" -l "$LOCATION" -o none 2>/dev/null || true
 
 # First create/update WITHOUT auth to obtain the FQDN, then re-run with AUTH_* set.
 az containerapp create -n "$APP" -g "$RG" --environment "$ENVN" \
-  --image "$ACR.azurecr.io/$APP:latest" \
+  --image "$IMAGE" \
   --registry-server "$ACR.azurecr.io" \
   --ingress external --target-port 8080 \
   --min-replicas 1 --max-replicas 1 \
@@ -60,22 +71,31 @@ az containerapp create -n "$APP" -g "$RG" --environment "$ENVN" \
 FQDN=$(az containerapp show -n "$APP" -g "$RG" --query properties.configuration.ingress.fqdn -o tsv)
 echo "App URL: https://$FQDN   (redirect URI: https://$FQDN/auth/callback)"
 
-# Grant the app's Managed Identity read access to the Key Vault secret
+# Grant the app's Managed Identity read access to the Key Vault secret.
+# --name is the vault name. A failure stops the script.
 PID=$(az containerapp show -n "$APP" -g "$RG" --query identity.principalId -o tsv)
-az keyvault set-policy --name "${KV_URL#https://}" --object-id "$PID" --secret-permissions get 2>/dev/null \
-  || echo "NOTE: grant the MI '$PID' get access on secret '$KV_SECRET' (RBAC or access policy)."
+az keyvault set-policy --name "$KV_NAME" --object-id "$PID" --secret-permissions get
 
-# Once the app is registered in the landrycmd tenant, re-run this block with AUTH_* set:
+# Point the running app at the image this run just built.
+# One --set-env-vars list: update merges those pairs and leaves the rest.
+# --replace-env-vars would clear the list first and keep only its own pairs.
 if [ -n "$AUTH_CLIENT_ID" ]; then
+  # update_containerapp does not take --secrets. secret set stores the value.
+  az containerapp secret set -n "$APP" -g "$RG" \
+    --secrets "auth-client-secret=$AUTH_CLIENT_SECRET" -o none
   az containerapp update -n "$APP" -g "$RG" \
+    --image "$IMAGE" \
     --set-env-vars \
+      JARVIS_TRADING_API=https://trading.landrycmd.com \
+      KEY_VAULT_URL="$KV_URL" \
+      JARVIS_TOKEN_SECRET_NAME="$KV_SECRET" \
       AUTH_CLIENT_ID="$AUTH_CLIENT_ID" \
       AUTH_TENANT_ID="$AUTH_TENANT_ID" \
       PUBLIC_BASE_URL="https://$FQDN" \
-    --secrets auth-client-secret="$AUTH_CLIENT_SECRET" \
-    --replace-env-vars AUTH_CLIENT_SECRET=secretref:auth-client-secret \
+      AUTH_CLIENT_SECRET=secretref:auth-client-secret \
     -o none
   echo "auth enabled; connect from Claude at https://$FQDN/mcp"
 else
+  az containerapp update -n "$APP" -g "$RG" --image "$IMAGE" -o none
   echo "NEXT: register the app in the landrycmd tenant with redirect https://$FQDN/auth/callback, then re-run with AUTH_* set."
 fi
