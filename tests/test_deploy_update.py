@@ -1,4 +1,4 @@
-"""deploy.sh keeps env, image, registry, and the Key Vault grant. az is a stub on PATH."""
+"""deploy.sh keeps env, image, registry pull, and the Key Vault grant. az is a stub on PATH."""
 import os
 import stat
 import subprocess
@@ -9,7 +9,18 @@ import unittest
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SECRET = "fake-client-secret-value-0123"
 VAULT_NAME = "kv-jarvis-lab2"
+AUTH_KV_SECRET = "jarvis-trading-auth-client-secret"
 IMAGE_SUFFIX = ".azurecr.io/jarvis-trading-mcp:latest"
+VAULT_ID = (
+    "/subscriptions/fake/resourceGroups/rg-other/providers/Microsoft.KeyVault/vaults/"
+    + VAULT_NAME
+)
+PID = "00000000-0000-0000-0000-000000000099"
+BACKEND_ENV = {
+    "JARVIS_TRADING_API": "https://trading.landrycmd.com",
+    "KEY_VAULT_URL": "https://kv-jarvis-lab2.vault.azure.net/",
+    "JARVIS_TOKEN_SECRET_NAME": "jarvis-trading-token",
+}
 
 AZ_STUB = textwrap.dedent(
     r"""
@@ -20,10 +31,15 @@ AZ_STUB = textwrap.dedent(
     redact = os.environ.get("AZ_REDACT", "")
     args = sys.argv[1:]
     safe = []
+    leaked = False
     for a in args:
         if redact and redact in a:
+            leaked = True
             a = a.replace(redact, "***")
         safe.append(a)
+    if leaked:
+        # The raw value stays out of the log. The marker is how the test sees it.
+        safe.append("SECRET_IN_ARGV")
     with open(log, "a") as f:
         f.write("\t".join(safe) + "\n")
     cmd = args[0] if args else ""
@@ -41,7 +57,18 @@ AZ_STUB = textwrap.dedent(
         return set(open(state).read().split())
 
     if cmd == "acr" and sub == "show":
-        sys.exit(0 if flag("-n") in created() else 1)
+        name = flag("-n") or flag("--name")
+        if name not in created():
+            sys.exit(1)
+        if flag("--query") == "id":
+            rg = flag("-g") or flag("--resource-group") or "rg"
+            print(
+                "/subscriptions/fake/resourceGroups/"
+                + rg
+                + "/providers/Microsoft.ContainerRegistry/registries/"
+                + name
+            )
+        sys.exit(0)
     if cmd == "acr" and sub == "create":
         name = flag("-n")
         have = created()
@@ -56,15 +83,66 @@ AZ_STUB = textwrap.dedent(
         if "fqdn" in q:
             print("fake-app.example.internal")
         elif "principalId" in q:
-            print("00000000-0000-0000-0000-000000000099")
+            counter = os.path.join(os.path.dirname(state), "pid-shows")
+            n = 0
+            if os.path.exists(counter):
+                n = int(open(counter).read() or "0")
+            n += 1
+            with open(counter, "w") as f:
+                f.write(str(n))
+            blank = int(os.environ.get("AZ_PID_BLANK_COUNT", "0") or "0")
+            if n <= blank:
+                print("")
+            else:
+                print("00000000-0000-0000-0000-000000000099")
+        sys.exit(0)
+    if cmd == "keyvault" and sub == "show":
+        q = flag("--query") or ""
+        if "enableRbacAuthorization" in q:
+            print("true" if os.environ.get("AZ_KV_RBAC") == "1" else "false")
+        elif q == "id":
+            print(
+                "/subscriptions/fake/resourceGroups/rg-other/providers/"
+                "Microsoft.KeyVault/vaults/kv-jarvis-lab2"
+            )
         sys.exit(0)
     if cmd == "keyvault" and sub == "set-policy":
         if os.environ.get("AZ_POLICY_FAIL") == "1":
             sys.stderr.write("set-policy failed\n")
             sys.exit(1)
         sys.exit(0)
+    if cmd == "keyvault" and sub == "secret" and len(args) > 2 and args[2] == "set":
+        path = flag("--file")
+        marker = ""
+        if path and redact and os.path.isfile(path):
+            data = open(path, "rb").read()
+            raw = redact.encode()
+            if data == raw:
+                marker = "SECRET_FILE_EXACT"
+            elif raw in data:
+                marker = "SECRET_FILE_HAS_VALUE_PLUS_EXTRA"
+        if marker:
+            with open(log, "a") as f:
+                f.write(marker + "\n")
+        sys.exit(0)
+    if cmd == "role" and sub == "assignment" and len(args) > 2 and args[2] == "create":
+        if os.environ.get("AZ_ROLE_FAIL") == "1":
+            sys.stderr.write("ERROR: (AuthorizationFailed) no permission to assign role\n")
+            sys.exit(1)
+        if os.environ.get("AZ_ROLE_EXISTS") == "1":
+            sys.stderr.write(
+                "ERROR: (RoleAssignmentExists) The role assignment already exists.\n"
+            )
+            sys.exit(1)
+        sys.exit(0)
     if cmd == "containerapp" and sub == "create" and os.environ.get("AZ_CREATE_EXISTS") == "1":
-        sys.stderr.write("app exists\n")
+        sys.stderr.write(
+            "ERROR: (ContainerAppAlreadyExists) The container app "
+            "'jarvis-trading-mcp' already exists.\n"
+        )
+        sys.exit(1)
+    if cmd == "containerapp" and sub == "create" and os.environ.get("AZ_CREATE_FAIL") == "1":
+        sys.stderr.write("ERROR: (InvalidResource) location is unavailable\n")
         sys.exit(1)
     sys.exit(0)
     """
@@ -123,15 +201,49 @@ class DeployUpdateTests(unittest.TestCase):
             with open(log) as f:
                 lines = [ln.split("\t") for ln in f.read().splitlines() if ln]
         blob = r.stdout + r.stderr + "\n" + "\n".join(" ".join(a) for a in lines)
-        self.assertFalse(SECRET in blob, "secret leaked into deploy output or the az log")
+        self.assertNotIn("SECRET_IN_ARGV", blob, "client secret was an az argument")
+        self.assertNotIn(SECRET, blob, "secret leaked into deploy output or the az log")
+        self.assertNotIn("SECRET_FILE_HAS_VALUE_PLUS_EXTRA", blob)
         return r, lines
+
+    def install_az(self, stub_dir):
+        az = os.path.join(stub_dir, "az")
+        with open(az, "w") as f:
+            f.write(AZ_STUB)
+        os.chmod(az, os.stat(az).st_mode | stat.S_IEXEC)
+
+    def assertRegistryPull(self, lines, image):
+        server = image.split("/")[0]
+        reg = _cmds(lines, "containerapp", "registry", "set")
+        self.assertEqual(len(reg), 1, lines)
+        self.assertEqual(_flag(reg[0], "--server"), server)
+        self.assertEqual(_flag(reg[0], "--identity"), "system")
+        self.assertNotIn("--password", reg[0])
+        self.assertNotIn("--username", reg[0])
+        update = _cmds(lines, "containerapp", "update")
+        self.assertEqual(len(update), 1)
+        self.assertEqual(_flag(update[0], "--image"), image)
+        self.assertLess(lines.index(reg[0]), lines.index(update[0]))
+        pulls = [
+            a for a in _cmds(lines, "role", "assignment", "create")
+            if _flag(a, "--role") == "AcrPull"
+        ]
+        self.assertEqual(len(pulls), 1, lines)
+        self.assertEqual(_flag(pulls[0], "--assignee-object-id"), PID)
+        self.assertEqual(_flag(pulls[0], "--assignee-principal-type"), "ServicePrincipal")
+        self.assertEqual(
+            _flag(pulls[0], "--scope"),
+            "/subscriptions/fake/resourceGroups/rg-jarvis-mcp/providers/"
+            "Microsoft.ContainerRegistry/registries/" + server.split(".")[0],
+        )
+        self.assertLess(lines.index(pulls[0]), lines.index(reg[0]))
+        for args in lines:
+            self.assertNotIn("--registry-password", args)
+            self.assertNotIn("--password", args)
 
     def test_second_deploy_keeps_env_image_and_registry(self):
         with tempfile.TemporaryDirectory() as d:
-            az = os.path.join(d, "az")
-            with open(az, "w") as f:
-                f.write(AZ_STUB)
-            os.chmod(az, os.stat(az).st_mode | stat.S_IEXEC)
+            self.install_az(d)
 
             r1, lines1 = self.run_deploy(d, {})
             self.assertEqual(r1.returncode, 0, r1.stdout + r1.stderr)
@@ -145,7 +257,14 @@ class DeployUpdateTests(unittest.TestCase):
             plain_update = _cmds(lines1, "containerapp", "update")
             self.assertEqual(len(plain_update), 1)
             self.assertEqual(_flag(plain_update[0], "--image"), image)
-            self.assertNotIn("--set-env-vars", plain_update[0])
+            self.assertNotIn("--replace-env-vars", plain_update[0])
+            self.assertEqual(
+                dict(p.split("=", 1) for p in _values_after(plain_update[0], "--set-env-vars")),
+                BACKEND_ENV,
+            )
+            self.assertEqual(_cmds(lines1, "keyvault", "secret", "set"), [])
+            self.assertEqual(_cmds(lines1, "containerapp", "secret", "set"), [])
+            self.assertRegistryPull(lines1, image)
             policy = _cmds(lines1, "keyvault", "set-policy")
             self.assertEqual(len(policy), 1)
             self.assertEqual(_flag(policy[0], "--name"), VAULT_NAME)
@@ -164,7 +283,8 @@ class DeployUpdateTests(unittest.TestCase):
             blob2 = r2.stdout + r2.stderr
             self.assertEqual(r2.returncode, 0, blob2)
             self.assertEqual(_cmds(lines2, "acr", "create"), [])
-            self.assertEqual(len(_cmds(lines2, "acr", "show")), 1)
+            # existence check, then the id used as the AcrPull scope
+            self.assertEqual(len(_cmds(lines2, "acr", "show")), 2)
             self.assertIn("app exists", blob2)
             update = _cmds(lines2, "containerapp", "update")
             self.assertEqual(len(update), 1)
@@ -188,15 +308,33 @@ class DeployUpdateTests(unittest.TestCase):
             self.assertNotIn("--secrets", args)
             secret_set = _cmds(lines2, "containerapp", "secret", "set")
             self.assertEqual(len(secret_set), 1)
-            self.assertEqual(_flag(secret_set[0], "--secrets"), "auth-client-secret=***")
+            self.assertEqual(
+                _flag(secret_set[0], "--secrets"),
+                "auth-client-secret=keyvaultref:https://kv-jarvis-lab2.vault.azure.net/secrets/"
+                + AUTH_KV_SECRET
+                + ",identityref:system",
+            )
+            kv_set = _cmds(lines2, "keyvault", "secret", "set")
+            self.assertEqual(len(kv_set), 1)
+            self.assertEqual(_flag(kv_set[0], "--vault-name"), VAULT_NAME)
+            self.assertEqual(_flag(kv_set[0], "--name"), AUTH_KV_SECRET)
+            self.assertTrue(_flag(kv_set[0], "--file"))
+            self.assertNotIn("--value", kv_set[0])
+            self.assertIn(["SECRET_FILE_EXACT"], lines2)
             self.assertEqual(_flag(_cmds(lines2, "keyvault", "set-policy")[0], "--name"), VAULT_NAME)
+            self.assertEqual(
+                [
+                    _flag(a, "--role")
+                    for a in _cmds(lines2, "role", "assignment", "create")
+                    if _flag(a, "--role") == "Key Vault Secrets User"
+                ],
+                [],
+            )
+            self.assertRegistryPull(lines2, image)
 
     def test_acr_name_override_is_reused(self):
         with tempfile.TemporaryDirectory() as d:
-            az = os.path.join(d, "az")
-            with open(az, "w") as f:
-                f.write(AZ_STUB)
-            os.chmod(az, os.stat(az).st_mode | stat.S_IEXEC)
+            self.install_az(d)
             r1, lines1 = self.run_deploy(d, {"ACR_NAME": "acrjarviscustom1"})
             self.assertEqual(r1.returncode, 0, r1.stdout + r1.stderr)
             self.assertEqual(_flag(_cmds(lines1, "acr", "create")[0], "-n"), "acrjarviscustom1")
@@ -205,13 +343,131 @@ class DeployUpdateTests(unittest.TestCase):
             self.assertEqual(_cmds(lines2, "acr", "create"), [])
             image = "acrjarviscustom1" + IMAGE_SUFFIX
             self.assertEqual(_flag(_cmds(lines2, "containerapp", "update")[0], "--image"), image)
+            self.assertRegistryPull(lines2, image)
+
+    def test_no_auth_rerun_sets_backend_env(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.install_az(d)
+            r, lines = self.run_deploy(d, {"AZ_CREATE_EXISTS": "1"})
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("app exists", r.stdout)
+            update = _cmds(lines, "containerapp", "update")
+            self.assertEqual(len(update), 1)
+            self.assertNotIn("--replace-env-vars", update[0])
+            pairs = _values_after(update[0], "--set-env-vars")
+            got = dict(p.split("=", 1) for p in pairs)
+            self.assertEqual(got, BACKEND_ENV)
+            for key in got:
+                self.assertFalse(key.startswith("AUTH_"))
+            self.assertRegistryPull(lines, "acrjarvismcp" + IMAGE_SUFFIX)
+
+    def test_create_failure_other_than_exists_stops(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.install_az(d)
+            r, lines = self.run_deploy(d, {"AZ_CREATE_FAIL": "1"})
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("InvalidResource", r.stderr)
+            self.assertNotIn("app exists", r.stdout + r.stderr)
+            self.assertEqual(_cmds(lines, "containerapp", "show"), [])
+            self.assertEqual(_cmds(lines, "containerapp", "registry", "set"), [])
+            self.assertEqual(_cmds(lines, "containerapp", "update"), [])
+            self.assertEqual(_cmds(lines, "keyvault", "set-policy"), [])
+            self.assertEqual(_cmds(lines, "role", "assignment", "create"), [])
+
+    def test_rbac_vault_assigns_secret_scoped_role(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.install_az(d)
+            r, lines = self.run_deploy(
+                d,
+                {
+                    "AZ_KV_RBAC": "1",
+                    "AZ_CREATE_EXISTS": "1",
+                    "AUTH_CLIENT_ID": "app-id",
+                    "AUTH_TENANT_ID": "tenant-id",
+                    "AUTH_CLIENT_SECRET": SECRET,
+                },
+            )
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertEqual(_cmds(lines, "keyvault", "set-policy"), [])
+            shows = _cmds(lines, "keyvault", "show")
+            self.assertTrue(
+                any("enableRbacAuthorization" in (_flag(a, "--query") or "") for a in shows)
+            )
+            self.assertEqual(_flag(shows[0], "-n"), VAULT_NAME)
+            roles = _cmds(lines, "role", "assignment", "create")
+            kv_scopes = [
+                _flag(a, "--scope") for a in roles if _flag(a, "--role") == "Key Vault Secrets User"
+            ]
+            self.assertEqual(
+                kv_scopes,
+                [
+                    VAULT_ID + "/secrets/jarvis-trading-token",
+                    VAULT_ID + "/secrets/" + AUTH_KV_SECRET,
+                ],
+            )
+            joined = "\n".join(" ".join(a) for a in lines)
+            self.assertIn("SECRET_FILE_EXACT", joined)
+            self.assertRegistryPull(lines, "acrjarvismcp" + IMAGE_SUFFIX)
+
+    def test_existing_role_assignment_does_not_stop_deploy(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.install_az(d)
+            r, lines = self.run_deploy(
+                d, {"AZ_KV_RBAC": "1", "AZ_ROLE_EXISTS": "1", "AZ_CREATE_EXISTS": "1"}
+            )
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertGreaterEqual(len(_cmds(lines, "role", "assignment", "create")), 1)
+            self.assertEqual(_cmds(lines, "keyvault", "set-policy"), [])
+            self.assertEqual(len(_cmds(lines, "containerapp", "update")), 1)
+            self.assertEqual(len(_cmds(lines, "containerapp", "registry", "set")), 1)
+
+    def test_other_grant_error_stops_before_update(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.install_az(d)
+            r, lines = self.run_deploy(d, {"AZ_KV_RBAC": "1", "AZ_ROLE_FAIL": "1"})
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("AuthorizationFailed", r.stderr)
+            self.assertEqual(_cmds(lines, "keyvault", "set-policy"), [])
+            self.assertEqual(_cmds(lines, "containerapp", "registry", "set"), [])
+            self.assertEqual(_cmds(lines, "containerapp", "update"), [])
+
+    def test_acr_pull_error_stops_before_image_update(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.install_az(d)
+            r, lines = self.run_deploy(d, {"AZ_ROLE_FAIL": "1"})
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("AuthorizationFailed", r.stderr)
+            self.assertEqual(len(_cmds(lines, "keyvault", "set-policy")), 1)
+            self.assertEqual(_cmds(lines, "containerapp", "registry", "set"), [])
+            self.assertEqual(_cmds(lines, "containerapp", "update"), [])
+
+    def test_empty_principal_stops_before_grant(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.install_az(d)
+            r, lines = self.run_deploy(d, {"AZ_PID_BLANK_COUNT": "9"})
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("principalId", r.stderr)
+            self.assertEqual(_cmds(lines, "keyvault", "set-policy"), [])
+            self.assertEqual(_cmds(lines, "role", "assignment", "create"), [])
+            self.assertEqual(_cmds(lines, "containerapp", "registry", "set"), [])
+            self.assertEqual(_cmds(lines, "containerapp", "update"), [])
+
+    def test_principal_blank_then_present_is_used(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.install_az(d)
+            r, lines = self.run_deploy(d, {"AZ_PID_BLANK_COUNT": "1"})
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            pid_shows = [
+                a for a in _cmds(lines, "containerapp", "show")
+                if "principalId" in (_flag(a, "--query") or "")
+            ]
+            self.assertGreaterEqual(len(pid_shows), 2)
+            policy = _cmds(lines, "keyvault", "set-policy")
+            self.assertEqual(_flag(policy[0], "--object-id"), PID)
 
     def test_vault_grant_failure_stops_the_script(self):
         with tempfile.TemporaryDirectory() as d:
-            az = os.path.join(d, "az")
-            with open(az, "w") as f:
-                f.write(AZ_STUB)
-            os.chmod(az, os.stat(az).st_mode | stat.S_IEXEC)
+            self.install_az(d)
             r, lines = self.run_deploy(d, {"AZ_POLICY_FAIL": "1"})
             self.assertNotEqual(r.returncode, 0)
             self.assertNotIn("NOTE:", r.stdout)

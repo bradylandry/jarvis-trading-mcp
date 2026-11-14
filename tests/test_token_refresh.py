@@ -161,6 +161,38 @@ class TokenRefreshTests(unittest.TestCase):
         self.assertEqual(self.w.vault_reads, 4)
         self.assertEqual(self.w.sent[-1], "tok-two-bbbbbbbb")
 
+    def test_failed_reread_keeps_message_not_the_response(self):
+        self.srv.get_crash_risk()
+        payload = {"response_body": "tok-two-bbbbbbbb"}
+
+        class VaultDown(RuntimeError):
+            def __init__(self, message, response=None):
+                super().__init__(message)
+                self.response = response
+
+        original = VaultDown("vault down", response=payload)
+
+        def boom():
+            raise original
+
+        self.srv._read_token_source = boom
+        self.w.accepted = "nope"
+        with self.assertRaises(VaultDown) as cm:
+            self.srv.get_crash_risk()
+        self.assertIs(cm.exception, original)
+        stored = self.srv._failed_reread_error
+        self.assertIsInstance(stored, VaultDown)
+        self.assertEqual(str(stored), "vault down")
+        self.assertIsNot(stored, original)
+        self.assertIsNone(stored.response)
+        self.srv._read_token_source = lambda: "tok-two-bbbbbbbb"
+        self.w.accepted = "tok-two-bbbbbbbb"
+        token, _gen = self.srv._backend_token()
+        self.assertEqual(token, "tok-two-bbbbbbbb")
+        self.assertIsNone(self.srv._failed_reread_error)
+        self.assertIsNone(self.srv._failed_reread_gen)
+        self.assertEqual(self.srv.get_crash_risk(), {"composite": 4.2})
+
 
 if __name__ == "__main__":
     unittest.main()

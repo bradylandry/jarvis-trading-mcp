@@ -80,8 +80,9 @@ mcp = FastMCP(
 _token_cache: str | None = None
 _token_gen = 0  # bumped on every successful read, so concurrent 401s share one reread
 _token_lock = threading.Lock()
-# One failed reread per rejected generation. Overlapping callers raise it instead of
-# reading again. The cache stays empty, so this is not a cached token and the next call reads again.
+# One failed reread per rejected generation. Overlapping callers raise a copy instead of
+# reading again. Only the type and message are kept, and a later successful read drops them.
+# The cache stays empty, so this is not a cached token and the next call reads again.
 _failed_reread_gen: int | None = None
 _failed_reread_error: Exception | None = None
 
@@ -109,11 +110,15 @@ def _read_token_source() -> str:
 
 def _backend_token() -> tuple[str, int]:
     """Return the cached token and its generation, reading the source on first use."""
-    global _token_cache, _token_gen
+    global _token_cache, _token_gen, _failed_reread_gen, _failed_reread_error
     with _token_lock:
         if not _token_cache:
             _token_cache = _read_token_source()
             _token_gen += 1
+            # Drop a stored failure once the cache is filled, so a Key Vault
+            # response object is not kept for the process lifetime.
+            _failed_reread_gen = None
+            _failed_reread_error = None
         return _token_cache, _token_gen
 
 
@@ -141,7 +146,8 @@ def _refresh_backend_token(rejected_gen: int) -> tuple[str, int]:
             tok = _read_token_source()
         except Exception as e:
             _failed_reread_gen = rejected_gen
-            _failed_reread_error = e
+            # type and message only. The original may reference a Key Vault response.
+            _failed_reread_error = _copy_error(e)
             raise
         _token_cache = tok
         _token_gen += 1
