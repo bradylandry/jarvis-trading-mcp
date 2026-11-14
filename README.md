@@ -260,7 +260,7 @@ to avoid leaking upstream content into your context.
 
 - `friend_mcp/server.py` is the whole server: 7 `@mcp.tool` wrappers over
   `trading.landrycmd.com`, `AzureProvider` OAuth (enabled when
-  `AUTH_CLIENT_ID` is set), backend token via Key Vault / Keychain, and a
+  `AUTH_CLIENT_ID` is set; any half-set sign-in config refuses to start), backend token via Key Vault / Keychain, and a
   lock-guarded rate limiter. It fails closed on a public bind without auth.
 - `run-local.sh` starts it on loopback with the token from the Keychain, no
   OAuth, for development.

@@ -8,7 +8,8 @@ desktop / mobile behind Entra OAuth.
 Auth model:
   - Client -> this server: Entra OAuth (AzureProvider), the *landrycmd* tenant. Enabled only
     when AUTH_CLIENT_ID is set (i.e. in the deployed Container App); omitted locally so
-    loopback dev runs without a token. Fails CLOSED on a public bind (see main()).
+    loopback dev runs without a token. Fails CLOSED on a public bind (see main()), and on any
+    half-set sign-in config (some of the four settings below set without the rest).
   - This server -> trading API: static X-API-Token, sourced from macOS Keychain (local, via
     JARVIS_TRADING_TOKEN set by run-local.sh) or Azure Key Vault via Managed Identity (in
     Azure). Never written to disk.
@@ -46,23 +47,43 @@ TIMEOUT_S = 90
 RATE_LIMIT_MAX_CALLS = int(os.environ.get("JARVIS_TRADING_MAX_CALLS_PER_MIN", "30"))
 RATE_LIMIT_WINDOW_S = 60
 
+
+def _env(name: str) -> str:
+    """Env value with whitespace stripped; blank counts as unset."""
+    return (os.environ.get(name) or "").strip()
+
+
 # --- User authentication (Entra OAuth). Enabled only when AUTH_CLIENT_ID is set (deployed). ---
+# Any half-set sign-in config (some of the four settings set without the rest) refuses to start.
 _auth = None
-if os.environ.get("AUTH_CLIENT_ID"):
+if _env("AUTH_CLIENT_ID"):
     # Fail CLOSED on half-set sign-in. With an empty secret, FastMCP derives its JWT signing key
     # and storage key from the empty string, a public value, and still starts.
-    if not (os.environ.get("AUTH_CLIENT_SECRET") or "").strip():
+    if not _env("AUTH_CLIENT_SECRET"):
         raise SystemExit(
             "refusing to start: AUTH_CLIENT_ID is set but AUTH_CLIENT_SECRET is empty; "
             "set the client secret or unset AUTH_CLIENT_ID"
         )
+    _missing = [k for k in ("AUTH_TENANT_ID", "PUBLIC_BASE_URL") if not _env(k)]
+    if _missing:
+        raise SystemExit(
+            f"refusing to start: AUTH_CLIENT_ID is set but missing {', '.join(_missing)}; "
+            "set the missing settings or unset AUTH_CLIENT_ID"
+        )
     _auth = AzureProvider(
-        client_id=os.environ["AUTH_CLIENT_ID"],
-        client_secret=os.environ.get("AUTH_CLIENT_SECRET"),
-        tenant_id=os.environ["AUTH_TENANT_ID"],
+        client_id=_env("AUTH_CLIENT_ID"),
+        client_secret=_env("AUTH_CLIENT_SECRET"),
+        tenant_id=_env("AUTH_TENANT_ID"),
         required_scopes=["read"],
-        base_url=os.environ["PUBLIC_BASE_URL"],
+        base_url=_env("PUBLIC_BASE_URL"),
     )
+else:
+    _set = [k for k in ("AUTH_CLIENT_SECRET", "AUTH_TENANT_ID", "PUBLIC_BASE_URL") if _env(k)]
+    if _set:
+        raise SystemExit(
+            f"refusing to start: sign-in is half set ({', '.join(_set)} set but AUTH_CLIENT_ID "
+            "is empty); set AUTH_CLIENT_ID or unset the others"
+        )
 
 mcp = FastMCP(
     "Jarvis Trading",
